@@ -190,7 +190,11 @@ fn persona_fixture(id: &str, prompt: &str, model: Option<&str>) -> PersonaRecord
 fn resolve_prompt_agent_override_wins_over_persona() {
     // Option A: when the agent record has explicit values (set via Edit dialog),
     // they take priority over the persona's live values.
-    let personas = vec![persona_fixture("custom:bot", "Persona prompt", Some("gpt-5"))];
+    let personas = vec![persona_fixture(
+        "custom:bot",
+        "Persona prompt",
+        Some("gpt-5"),
+    )];
 
     let (prompt, model) = resolve_effective_prompt_and_model(
         Some("custom:bot"),
@@ -207,7 +211,11 @@ fn resolve_prompt_agent_override_wins_over_persona() {
 fn resolve_prompt_reads_persona_when_no_agent_override() {
     // When agent record fields are None (the default for persona-backed agents
     // after creation), the persona's live values are used.
-    let personas = vec![persona_fixture("custom:bot", "Fresh persona prompt", Some("gpt-5"))];
+    let personas = vec![persona_fixture(
+        "custom:bot",
+        "Fresh persona prompt",
+        Some("gpt-5"),
+    )];
 
     let (prompt, model) =
         resolve_effective_prompt_and_model(Some("custom:bot"), &personas, None, None);
