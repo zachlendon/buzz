@@ -170,7 +170,7 @@ export function ChannelMenuButton({
       className={cn(
         !isActive &&
           hasUnread &&
-          "font-semibold text-sidebar-foreground hover:text-sidebar-foreground",
+          "text-sidebar-foreground hover:text-sidebar-foreground",
         !isActive && isMuted && !hasUnread && "opacity-50",
       )}
       data-channel-id={channel.id}
