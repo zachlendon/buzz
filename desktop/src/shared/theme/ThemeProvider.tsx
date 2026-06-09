@@ -12,7 +12,6 @@ import {
   type AppThemeName,
   type SyntaxThemeName,
   extractThemeInfo,
-  getLocalTheme,
   isAppThemeName,
   loadThemeData,
   prefersDarkMode,
@@ -117,6 +116,8 @@ function applyCachedVars(themeName: AppThemeName, systemIsDark: boolean) {
       }
       root.classList.remove("light", "dark");
       root.classList.add(systemIsDark ? "dark" : "light");
+      const accent = window.localStorage.getItem(ACCENT_KEY) ?? DEFAULT_ACCENT;
+      applyAccentColor(accent);
       return;
     }
 
@@ -220,7 +221,6 @@ export function ThemeProvider({
     if (!isAppThemeName(themeName)) return;
 
     // Track which theme we're loading to avoid race conditions
-    const thisTheme = themeName;
     const thisLoadKey = `${themeName}:${systemIsDark}`;
     loadingRef.current = thisLoadKey;
     setIsLoading(true);
@@ -230,21 +230,18 @@ export function ThemeProvider({
       if (loadingRef.current === thisLoadKey) {
         setIsDark(dark);
         setIsLoading(false);
-        // Re-apply accent after syntax theme load (derived vars don't include primary).
-        if (!getLocalTheme(thisTheme)) {
-          applyAccentColor(
-            window.localStorage.getItem(ACCENT_KEY) ?? DEFAULT_ACCENT,
-          );
-        }
+        // Re-apply accent after theme load since theme vars reset primary colors.
+        applyAccentColor(
+          window.localStorage.getItem(ACCENT_KEY) ?? DEFAULT_ACCENT,
+        );
       }
     });
   }, [themeName, systemIsDark]);
 
   // Apply accent color changes
   useEffect(() => {
-    if (getLocalTheme(themeName)) return;
     applyAccentColor(accentColor);
-  }, [accentColor, themeName]);
+  }, [accentColor]);
 
   const setTheme = useCallback((name: string) => {
     if (!isAppThemeName(name)) return;
