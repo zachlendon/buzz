@@ -3308,6 +3308,7 @@ mod error_outcome_emission_tests {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
+            serverless: false,
             // `true` exits cleanly, so the async respawn fails fast and
             // harmlessly off the JoinSet — irrelevant to the synchronous
             // feed emission under test.
@@ -3340,6 +3341,9 @@ mod error_outcome_emission_tests {
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             persona_env_vars: vec![],
+            profile_name: None,
+            profile_about: None,
+            profile_picture: None,
             relay_observer: false,
             agent_owner: None,
             no_base_prompt: false,

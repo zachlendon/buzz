@@ -124,7 +124,15 @@ async fn send_encrypted_message(
     // The rumor is a normal kind:9 channel message (with the `h` tag and any
     // NIP-10 thread tags), so once unwrapped it renders through the standard
     // message pipeline — including threaded replies.
-    let builder = events::build_message(channel_id, content, thread_ref, mention_refs, media, &[])?;
+    let builder = events::build_message(
+        channel_id,
+        content,
+        thread_ref,
+        mention_refs,
+        media,
+        &[],
+        &[],
+    )?;
     let rumor = builder.build(keys.public_key());
     let rumor_id = rumor.id.map(|id| id.to_hex()).unwrap_or_default();
 
@@ -438,7 +446,7 @@ pub async fn send_channel_message(
     // Replies ARE encrypted too: the NIP-10 thread tags live INSIDE the rumor
     // (the encrypted inner event), so threading is preserved without leaking
     // the reply as plaintext to the relays.
-    if kind_num == sprout_core::kind::KIND_STREAM_MESSAGE {
+    if kind_num == buzz_core_pkg::kind::KIND_STREAM_MESSAGE {
         let recip = encrypted_recipients(&state, &channel_id).await?;
         eprintln!(
             "sprout-desktop: [serverless] send to {channel_id}: encrypted_recipients = {:?}",
