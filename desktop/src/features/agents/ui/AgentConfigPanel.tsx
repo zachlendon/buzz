@@ -4,12 +4,16 @@ import { ChevronDown, ChevronRight, Info } from "lucide-react";
 import { useAgentConfigSurface } from "../hooks";
 import { cn } from "@/shared/lib/cn";
 import { Spinner } from "@/shared/ui/spinner";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/shared/ui/tooltip";
 import type {
   ConfigField,
   ConfigOrigin,
   NormalizedConfig,
   NormalizedField,
-  ConfigSourceReport,
 } from "@/shared/api/types";
 
 type Props = {
@@ -44,6 +48,28 @@ function originLabel(
   }
 }
 
+function originTooltip(
+  origin: ConfigOrigin,
+  configFilePath: string | null,
+): string {
+  switch (origin) {
+    case "buzzExplicit":
+      return "Set in Buzz UI";
+    case "acpConfigOption":
+      return "Set via ACP session";
+    case "acpNativeRead":
+      return "Read from ACP runtime";
+    case "envVar":
+      return "From environment variable";
+    case "configFile":
+      return configFilePath
+        ? `From config file (${configFilePath})`
+        : "From config file";
+    case "personaDefault":
+      return "From persona defaults";
+  }
+}
+
 function originColorClass(origin: ConfigOrigin): string {
   switch (origin) {
     case "buzzExplicit":
@@ -52,8 +78,9 @@ function originColorClass(origin: ConfigOrigin): string {
     case "acpNativeRead":
       return "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300";
     case "configFile":
-    case "personaDefault":
       return "bg-muted text-muted-foreground";
+    case "personaDefault":
+      return "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300";
     case "envVar":
       return "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300";
   }
@@ -67,15 +94,21 @@ function OriginBadge({
   configFilePath: string | null;
 }) {
   return (
-    <span
-      className={cn(
-        "inline-block max-w-[120px] truncate rounded px-1.5 py-0.5 text-[10px] font-medium leading-none",
-        originColorClass(origin),
-      )}
-      title={originLabel(origin, configFilePath)}
-    >
-      {originLabel(origin, configFilePath)}
-    </span>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className={cn(
+            "inline-block max-w-[120px] truncate rounded px-1.5 py-0.5 text-[10px] font-medium leading-none",
+            originColorClass(origin),
+          )}
+        >
+          {originLabel(origin, configFilePath)}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        {originTooltip(origin, configFilePath)}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -183,34 +216,6 @@ function AdvancedRow({
   );
 }
 
-// ── Sources footer ────────────────────────────────────────────────────────────
-
-const STATUS_ICON: Record<string, string> = {
-  available: "✓",
-  pending: "⏳",
-  notApplicable: "—",
-};
-
-function SourcesFooter({ sources }: { sources: ConfigSourceReport }) {
-  const tiers = [
-    { label: "Config file", status: sources.configFile },
-    { label: "ACP native", status: sources.acpNative },
-    { label: "ACP config", status: sources.acpConfigOptions },
-    { label: "Env vars", status: sources.envVars },
-  ] as const;
-
-  return (
-    <p className="mt-3 text-[10px] text-muted-foreground/70">
-      {tiers.map((tier, i) => (
-        <React.Fragment key={tier.label}>
-          {i > 0 && <span className="mx-1.5">|</span>}
-          {tier.label} <span>{STATUS_ICON[tier.status] ?? tier.status}</span>
-        </React.Fragment>
-      ))}
-    </p>
-  );
-}
-
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function AgentConfigPanel({ pubkey, isRunning: _isRunning }: Props) {
@@ -302,8 +307,6 @@ export function AgentConfigPanel({ pubkey, isRunning: _isRunning }: Props) {
           )}
         </div>
       )}
-
-      <SourcesFooter sources={sources} />
     </div>
   );
 }

@@ -1,5 +1,5 @@
 use crate::managed_agents::discovery::KnownAcpRuntime;
-use crate::managed_agents::types::ManagedAgentRecord;
+use crate::managed_agents::types::{ManagedAgentRecord, PersonaRecord};
 
 use super::types::*;
 
@@ -11,6 +11,7 @@ pub(crate) fn read_config_surface(
     record: &ManagedAgentRecord,
     runtime_meta: Option<&KnownAcpRuntime>,
     session_cache: Option<&SessionConfigCache>,
+    personas: &[PersonaRecord],
 ) -> RuntimeConfigSurface {
     let is_pre_spawn = session_cache.is_none();
 
@@ -97,19 +98,40 @@ pub(crate) fn read_config_surface(
                 .system_prompt
                 .clone()
                 .or_else(|| record.env_vars.get("BUZZ_ACP_SYSTEM_PROMPT").cloned());
-            record_system_prompt.as_ref().map(|v| NormalizedField {
-                value: Some(v.clone()),
-                origin: ConfigOrigin::BuzzExplicit,
-                is_writable: true,
-                write_via: ConfigWriteMechanism::RespawnWithEnvVar {
-                    env_key: "BUZZ_ACP_SYSTEM_PROMPT".to_string(),
-                },
-                overridden_value: file_config.system_prompt.clone(),
-                overridden_origin: file_config
-                    .system_prompt
-                    .as_ref()
-                    .map(|_| ConfigOrigin::ConfigFile),
-            })
+            if let Some(ref v) = record_system_prompt {
+                Some(NormalizedField {
+                    value: Some(v.clone()),
+                    origin: ConfigOrigin::BuzzExplicit,
+                    is_writable: true,
+                    write_via: ConfigWriteMechanism::RespawnWithEnvVar {
+                        env_key: "BUZZ_ACP_SYSTEM_PROMPT".to_string(),
+                    },
+                    overridden_value: file_config.system_prompt.clone(),
+                    overridden_origin: file_config
+                        .system_prompt
+                        .as_ref()
+                        .map(|_| ConfigOrigin::ConfigFile),
+                })
+            } else {
+                // Fall back to the linked persona's system prompt.
+                record
+                    .persona_id
+                    .as_deref()
+                    .and_then(|pid| personas.iter().find(|p| p.id == pid))
+                    .map(|p| NormalizedField {
+                        value: Some(p.system_prompt.clone()),
+                        origin: ConfigOrigin::PersonaDefault,
+                        is_writable: true,
+                        write_via: ConfigWriteMechanism::RespawnWithEnvVar {
+                            env_key: "BUZZ_ACP_SYSTEM_PROMPT".to_string(),
+                        },
+                        overridden_value: file_config.system_prompt.clone(),
+                        overridden_origin: file_config
+                            .system_prompt
+                            .as_ref()
+                            .map(|_| ConfigOrigin::ConfigFile),
+                    })
+            }
         },
     };
 
@@ -493,7 +515,7 @@ mod tests {
     fn pre_spawn_surface_reports_pending_acp_tiers() {
         let record = test_record();
         let runtime = test_runtime();
-        let surface = read_config_surface(&record, Some(runtime), None);
+        let surface = read_config_surface(&record, Some(runtime), None, &[]);
 
         assert!(surface.is_pre_spawn);
         assert_eq!(surface.sources.acp_native, ConfigTierStatus::Pending);
@@ -510,7 +532,7 @@ mod tests {
         record.model = Some("explicit-model".to_string());
         let runtime = test_runtime();
 
-        let surface = read_config_surface(&record, Some(runtime), None);
+        let surface = read_config_surface(&record, Some(runtime), None, &[]);
         let model = surface.normalized.model.unwrap();
         assert_eq!(model.value.as_deref(), Some("explicit-model"));
         assert_eq!(model.origin, ConfigOrigin::BuzzExplicit);
@@ -523,7 +545,7 @@ mod tests {
             provider_locked: true,
             ..*test_runtime()
         };
-        let surface = read_config_surface(&record, Some(runtime), None);
+        let surface = read_config_surface(&record, Some(runtime), None, &[]);
         let provider = surface.normalized.provider.unwrap();
         assert_eq!(provider.value.as_deref(), Some("Anthropic (locked)"));
         assert!(!provider.is_writable);
@@ -548,7 +570,7 @@ mod tests {
             captured_at: "".to_string(),
         };
 
-        let surface = read_config_surface(&record, Some(runtime), Some(&cache));
+        let surface = read_config_surface(&record, Some(runtime), Some(&cache), &[]);
         assert!(!surface.is_pre_spawn);
         let model = surface.normalized.model.unwrap();
         assert_eq!(model.value.as_deref(), Some("claude-opus-4"));
@@ -571,12 +593,48 @@ mod tests {
             captured_at: "".to_string(),
         };
 
-        let surface = read_config_surface(&record, Some(runtime), Some(&cache));
+        let surface = read_config_surface(&record, Some(runtime), Some(&cache), &[]);
         let model = surface.normalized.model.unwrap();
         assert_eq!(model.value.as_deref(), Some("acp-model"));
         assert_eq!(model.origin, ConfigOrigin::AcpConfigOption);
         // The goose config file might have a model too — since we can't control
         // the actual file in a unit test, just verify the override fields are populated
         // when we manually construct the scenario via build_model_field.
+    }
+
+    #[test]
+    fn persona_system_prompt_used_when_record_has_none() {
+        use crate::managed_agents::types::PersonaRecord;
+
+        let mut record = test_record();
+        record.persona_id = Some("persona-1".to_string());
+        let runtime = test_runtime();
+
+        let personas = vec![PersonaRecord {
+            id: "persona-1".to_string(),
+            display_name: "Test Persona".to_string(),
+            avatar_url: None,
+            system_prompt: "You are a helpful assistant.".to_string(),
+            runtime: None,
+            model: Some("test-model".to_string()),
+            provider: None,
+            name_pool: vec![],
+            is_builtin: false,
+            is_active: true,
+            source_team: None,
+            source_team_persona_slug: None,
+            env_vars: BTreeMap::new(),
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+        }];
+
+        let surface = read_config_surface(&record, Some(runtime), None, &personas);
+        let prompt = surface.normalized.system_prompt.unwrap();
+        assert_eq!(
+            prompt.value.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+        assert_eq!(prompt.origin, ConfigOrigin::PersonaDefault);
+        assert!(prompt.is_writable);
     }
 }

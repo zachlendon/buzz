@@ -12,7 +12,8 @@ use crate::{
             },
             writer::plan_config_write,
         },
-        known_acp_runtime, load_managed_agents, save_managed_agents, sync_managed_agent_processes,
+        known_acp_runtime, load_managed_agents, load_personas, save_managed_agents,
+        sync_managed_agent_processes,
     },
 };
 
@@ -47,11 +48,13 @@ pub async fn get_agent_config_surface(
 
     let runtime_meta = known_acp_runtime(&record.agent_command);
     let session_cache = state.get_session_cache(&pubkey);
+    let personas = load_personas(&app).unwrap_or_default();
 
     Ok(read_config_surface(
         &record,
         runtime_meta,
         session_cache.as_ref(),
+        &personas,
     ))
 }
 
@@ -80,7 +83,8 @@ pub async fn write_agent_config_field(
 
     let runtime_meta = known_acp_runtime(&record.agent_command);
     let session_cache = state.get_session_cache(&request.pubkey);
-    let surface = read_config_surface(&record, runtime_meta, session_cache.as_ref());
+    let personas = load_personas(&app).unwrap_or_default();
+    let surface = read_config_surface(&record, runtime_meta, session_cache.as_ref(), &personas);
 
     let mut result = plan_config_write(&surface, &request.field);
 
