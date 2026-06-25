@@ -74,6 +74,10 @@ export function useDecryptedTargetMessageEvents(
   );
 
   React.useEffect(() => {
+    setDecryptedEvents([]);
+  }, [activeChannel, selfPubkey]);
+
+  React.useEffect(() => {
     if (!canDecrypt || targetMessageEvents.length === 0) {
       return;
     }

@@ -1520,19 +1520,18 @@ pub async fn ingest_event(
     // insert, so it falls through here to keep that existing not-found behavior.
     if is_e2e_enforced_content_kind(kind_u32) {
         if let Some(ch_id) = channel_id {
-            match state.db.get_channel(ch_id).await {
-                Ok(channel) => {
-                    if channel.encryption_activated_at.is_some() {
-                        buzz_core::observer::validate_nip44_v2(&event.content).map_err(|_| {
-                            IngestError::Rejected(
-                                "invalid: private-channel content must be NIP-44 encrypted".into(),
-                            )
-                        })?;
-                    }
+            match state.channel_is_encrypted_cached(ch_id).await {
+                Ok(true) => {
+                    buzz_core::observer::validate_nip44_v2(&event.content).map_err(|_| {
+                        IngestError::Rejected(
+                            "invalid: private-channel content must be NIP-44 encrypted".into(),
+                        )
+                    })?;
                 }
+                Ok(false) => {}
                 Err(buzz_db::DbError::ChannelNotFound(_)) => {}
                 Err(e) => {
-                    return Err(IngestError::Rejected(format!("error: database error: {e}")));
+                    return Err(IngestError::Internal(format!("database error: {e}")));
                 }
             }
         }

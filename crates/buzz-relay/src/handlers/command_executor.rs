@@ -106,13 +106,11 @@ async fn enforce_latched_body(
     let Some(ch_id) = channel_id else {
         return Ok(());
     };
-    match state.db.get_channel(ch_id).await {
-        Ok(channel) if channel.encryption_activated_at.is_some() => {
-            latched_body_disposition(content)
-        }
-        Ok(_) => Ok(()),
+    match state.channel_is_encrypted_cached(ch_id).await {
+        Ok(true) => latched_body_disposition(content),
+        Ok(false) => Ok(()),
         Err(buzz_db::DbError::ChannelNotFound(_)) => Ok(()),
-        Err(e) => Err(IngestError::Rejected(format!("error: database error: {e}"))),
+        Err(e) => Err(IngestError::Internal(format!("database error: {e}"))),
     }
 }
 
@@ -134,7 +132,7 @@ async fn enforce_latched_approval_note(
     match state.db.get_workflow(workflow_id).await {
         Ok(w) => enforce_latched_body(state, content, w.channel_id).await,
         Err(buzz_db::DbError::NotFound(_)) => Ok(()),
-        Err(e) => Err(IngestError::Rejected(format!("error: database error: {e}"))),
+        Err(e) => Err(IngestError::Internal(format!("database error: {e}"))),
     }
 }
 

@@ -2,6 +2,7 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   KIND_STREAM_MESSAGE,
   KIND_STREAM_MESSAGE_EDIT,
+  KIND_STREAM_MESSAGE_V2,
 } from "@/shared/constants/kinds";
 import { nip44DecryptFromPeer } from "@/shared/api/tauri";
 import type { Channel, RelayEvent } from "@/shared/api/types";
@@ -20,9 +21,18 @@ export const UNDECRYPTABLE_DM_PLACEHOLDER =
  * Kinds that carry a user-authored free-text body in a DM and must therefore be
  * encrypted on send and decrypted at ingest. System messages, reactions, and
  * deletions carry no peer-encrypted body and are excluded.
+ *
+ * The relay's `is_e2e_enforced_content_kind` covers a broader set (pinned,
+ * bookmarked, scheduled, reminder, diff, forum, canvas) but only kinds the
+ * desktop client currently sends/receives in DMs are listed here. This list
+ * must grow in lockstep if new content kinds are added to DMs.
  */
 function isDmContentKind(kind: number): boolean {
-  return kind === KIND_STREAM_MESSAGE || kind === KIND_STREAM_MESSAGE_EDIT;
+  return (
+    kind === KIND_STREAM_MESSAGE ||
+    kind === KIND_STREAM_MESSAGE_V2 ||
+    kind === KIND_STREAM_MESSAGE_EDIT
+  );
 }
 
 /**
