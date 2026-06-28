@@ -7,7 +7,10 @@
 //! parallel-safe.
 
 use buzz_core::{
-    kind::{AUTHOR_ONLY_KINDS, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION},
+    kind::{
+        AUTHOR_ONLY_KINDS, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+        P_GATED_KINDS,
+    },
     CommunityId,
 };
 use buzz_search::{ChannelScope, SearchQuery, SearchService};
@@ -1019,6 +1022,113 @@ async fn author_only_kinds_are_storage_level_unsearchable() {
             "AUTHOR_ONLY kind:{kind} MUST NOT be searchable — \
              schema skip-set is missing this kind. AUTHOR_ONLY_KINDS={AUTHOR_ONLY_KINDS:?}, \
              hits={kinds:?}",
+        );
+    }
+
+    assert_eq!(
+        result.hits.len(),
+        1,
+        "expected exactly 1 hit (the kind:9 control), got {} (kinds={kinds:?})",
+        result.hits.len(),
+    );
+
+    teardown(pool, &schema).await;
+}
+
+/// Tripwire: every Rust-side `P_GATED_KINDS` entry that is *persistent* (not
+/// in the ephemeral 20000–29999 range) MUST be excluded from `search_tsv` at
+/// the storage layer.
+///
+/// L2 (the filter-level `#p` gate in `p_gated_filters_authorized`) prevents
+/// reachable leaks today, but it is Rust logic — a future bug or new exempt
+/// search entry point could surface tokenized content from these kinds. The
+/// L1 NULL tsvector is the unbreakable backstop: `@@` mathematically cannot
+/// match NULL. This test catches the drift where someone adds a persistent
+/// kind to `P_GATED_KINDS` without the matching `schema/schema.sql` +
+/// `migrations/0001_initial_schema.sql` skip-set update.
+///
+/// Ephemeral kinds (20000–29999) are skipped: they are never stored, so the
+/// storage-layer defense does not apply to them regardless of the schema
+/// CASE. `p_gated_filters_authorized` remains their sole defense by design.
+///
+/// Companion to `author_only_kinds_are_storage_level_unsearchable`: that test
+/// covers `AUTHOR_ONLY_KINDS` drift; this one covers `P_GATED_KINDS`
+/// persistent-subset drift. Together they tripwire both Rust-side privacy
+/// constants against the schema literal.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn p_gated_persistent_kinds_have_storage_null_tsvector() {
+    let (pool, schema) = setup().await;
+
+    let c = mk_community(&pool, "p-gated-tripwire.example").await;
+    let token = "pgated_tripwire_marker_qwerty";
+
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        rand_bytes32(),
+        9,
+        &format!("public control — {token}"),
+        None,
+        1_700_000_000,
+    )
+    .await;
+
+    let persistent: Vec<u32> = P_GATED_KINDS
+        .iter()
+        .copied()
+        .filter(|&k| !buzz_core::kind::is_ephemeral(k))
+        .collect();
+    assert!(
+        !persistent.is_empty(),
+        "P_GATED_KINDS must include at least one persistent kind for this \
+         test to be meaningful; got {P_GATED_KINDS:?}",
+    );
+
+    for (i, &kind) in persistent.iter().enumerate() {
+        insert_event(
+            &pool,
+            c,
+            rand_bytes32(),
+            rand_bytes32(),
+            kind as i32,
+            &format!("p-gated kind:{kind} — {token}"),
+            None,
+            1_700_000_100 + i as i64,
+        )
+        .await;
+    }
+
+    let svc = SearchService::new(pool.clone());
+    let result = svc
+        .search(&SearchQuery {
+            community: c,
+            q: token.into(),
+            channel_scope: ChannelScope::Any,
+            kinds: None,
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 100,
+        })
+        .await
+        .expect("search ok");
+
+    let kinds: Vec<i32> = result.hits.iter().map(|h| h.kind).collect();
+    assert!(
+        kinds.contains(&9),
+        "kind:9 control row MUST be searchable, got kinds={kinds:?}",
+    );
+
+    for &kind in &persistent {
+        assert!(
+            !kinds.contains(&(kind as i32)),
+            "P_GATED persistent kind:{kind} MUST NOT be searchable — \
+             schema NULL tsvector skip-set is missing this kind. Defense \
+             reduces to L2 (filter-level `#p` gate) alone. \
+             P_GATED_KINDS={P_GATED_KINDS:?}, hits={kinds:?}",
         );
     }
 

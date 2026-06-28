@@ -6,10 +6,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use buzz_core::filter::filters_match;
-use buzz_core::kind::{
-    AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_OBSERVER_FRAME, KIND_DM_VISIBILITY,
-    KIND_GIFT_WRAP, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
-};
+use buzz_core::kind::{AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_DM_VISIBILITY, P_GATED_KINDS};
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
 use buzz_pubsub::EventTopic;
@@ -24,13 +21,6 @@ use crate::state::AppState;
 
 const MAX_HISTORICAL_LIMIT: i64 = 2_000;
 const MAX_SUBSCRIPTIONS: usize = 1024;
-const P_GATED_KINDS: [u32; 5] = [
-    KIND_AGENT_OBSERVER_FRAME,
-    KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION,
-    KIND_GIFT_WRAP,
-    KIND_DM_VISIBILITY,
-];
 
 /// Handle a REQ message: register the subscription, deliver historical events, then send EOSE.
 pub async fn handle_req(
