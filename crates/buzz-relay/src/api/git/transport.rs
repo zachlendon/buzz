@@ -790,11 +790,14 @@ pub async fn receive_pack(
 /// [`finalize_push`] has decided to build a `Response` from these bytes.
 pub(crate) struct PackOutput {
     pub stdout: Vec<u8>,
-    /// Whether the `git receive-pack`/`upload-pack` subprocess exited 0.
+    /// Whether the push is safe to publish: the `git receive-pack` subprocess
+    /// exited 0 **and** its report-status reported no rejected (`ng`) ref.
     ///
-    /// A non-zero exit on `receive-pack` means git aborted the ref updates —
-    /// most importantly a **pre-receive hook decline** (authorization denied).
-    /// `finalize_push` must treat `false` as "push did not happen": skip the
+    /// A pre-receive hook decline (authorization denied) does NOT surface as a
+    /// non-zero exit — `git receive-pack --stateless-rpc` exits 0 and reports
+    /// the rejection only in-band as report-status. So `ok` must fold in the
+    /// report-status scan (`receive_pack_report_rejected`), not the exit code
+    /// alone. `finalize_push` treats `false` as "push did not happen": skip the
     /// CAS publish and the derived kind:30618 so a rejected push leaves **no
     /// published state**. The buffered stdout still carries git's in-band
     /// report-status so the client prints the rejection.
@@ -876,14 +879,121 @@ async fn run_git_at(
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!(stderr = %stderr, service = %service, "git subprocess exited with error");
         // Still return output — git protocol errors are communicated in-band.
-        // The non-zero exit is carried on `PackOutput.ok` so the push fence in
-        // `finalize_push` can refuse to publish on a hook decline (see below).
+        // A non-zero exit feeds `PackOutput.ok` below, but it is NOT the signal
+        // for a pre-receive hook decline: `git receive-pack --stateless-rpc`
+        // exits 0 on a hook decline, reporting the rejection only in-band as
+        // report-status (see `receive_pack_report_rejected`). The exit code
+        // still guards genuine subprocess failures (spawn/IO/abort).
+    }
+
+    // Primary fence for a denied push: scan the report-status for an `ng`
+    // (rejected) ref update. `git receive-pack` exits 0 on a pre-receive hook
+    // decline, so the exit code alone is insufficient — the rejection lives in
+    // the in-band report-status. Fold both signals into `ok` so `finalize_push`
+    // skips CAS publish + kind:30618 on any rejected ref.
+    let report_rejected = service == "receive-pack" && receive_pack_report_rejected(&output.stdout);
+    if report_rejected {
+        warn!(
+            service = %service,
+            "git receive-pack report-status contains a rejected (ng) ref update"
+        );
     }
 
     Ok(PackOutput {
         stdout: output.stdout,
-        ok: output.status.success(),
+        ok: output.status.success() && !report_rejected,
     })
+}
+
+/// Returns true when a `git receive-pack` report-status stream contains an
+/// `ng <ref> <reason>` line — i.e. git rejected at least one ref update.
+///
+/// Empirically, `git receive-pack --stateless-rpc` exits **0** even when a
+/// pre-receive hook rejects a push: the rejection is communicated only in-band
+/// to the client as report-status (`unpack ok` followed by `ng refs/...
+/// pre-receive hook declined`). The relay must therefore treat an `ng` status
+/// as "push did not happen" for the publish fence, not rely on the exit code.
+///
+/// ## Wire format
+///
+/// The report-status is a pkt-line stream. When side-band-64k is negotiated
+/// (which the stock client does), the status pkt-lines are **nested**: each
+/// outer pkt-line's payload begins with a channel byte (`1` = data, `2`/`3` =
+/// progress/error text), and the band-1 payload carries its *own* inner
+/// pkt-line stream:
+///
+/// ```text
+/// <outer-len>\x01<inner-len>unpack ok\n<inner-len>ng refs/heads/main ...\n0000
+/// ```
+///
+/// A naive "strip the band byte then split on \n" misses this: the rejection
+/// line surfaces as `0031ng refs/...` (inner length prefix glued on), which
+/// does not start with `ng `. So we de-frame one level deeper — for a band-1
+/// payload we parse the inner pkt-lines before matching. Without side-band the
+/// status pkt-lines appear directly at the outer level, which we also match.
+fn receive_pack_report_rejected(stdout: &[u8]) -> bool {
+    for payload in PktLineIter::new(stdout) {
+        match payload.first() {
+            // Side-band channel 1 (data): carries a nested pkt-line stream.
+            Some(1) => {
+                if PktLineIter::new(&payload[1..]).any(|line| line.starts_with(b"ng ")) {
+                    return true;
+                }
+            }
+            // Side-band channel 2/3 (progress/error text): never status lines.
+            Some(2 | 3) => {}
+            // No side-band: the status pkt-line payload is the line itself.
+            _ => {
+                if payload.starts_with(b"ng ") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Iterator over the payloads of a pkt-line stream.
+///
+/// Yields the bytes between the 4-hex length prefix and the end of each
+/// pkt-line. Skips flush (`0000`) / delim (`0001`) / response-end (`0002`)
+/// control pkts. Stops on the first malformed length or truncated frame
+/// (defensive: a corrupt stream simply produces no further matches rather
+/// than panicking).
+struct PktLineIter<'a> {
+    buf: &'a [u8],
+    i: usize,
+}
+
+impl<'a> PktLineIter<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, i: 0 }
+    }
+}
+
+impl<'a> Iterator for PktLineIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        loop {
+            if self.i + 4 > self.buf.len() {
+                return None;
+            }
+            let len_hex = std::str::from_utf8(&self.buf[self.i..self.i + 4]).ok()?;
+            let len = usize::from_str_radix(len_hex, 16).ok()?;
+            // 0000 (flush), 0001 (delim), 0002 (response-end): no payload.
+            if len < 4 {
+                self.i += 4;
+                continue;
+            }
+            if self.i + len > self.buf.len() {
+                return None;
+            }
+            let payload = &self.buf[self.i + 4..self.i + len];
+            self.i += len;
+            return Some(payload);
+        }
+    }
 }
 
 /// Keeps the git subprocess and its hydrated workspace alive for exactly as
@@ -1066,14 +1176,18 @@ pub(crate) struct PushContext {
 async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
     // The push fence, part 0 — **a rejected push publishes nothing.**
     //
-    // `git receive-pack` exits non-zero when the pre-receive hook declines
-    // (authorization denied) or git itself aborts the ref updates. In that
-    // case the workspace refs were NOT advanced, so there is no committed
-    // state to publish: we must skip the CAS pointer write AND the derived
-    // kind:30618 ref-state event. Otherwise a denied push would emit a
-    // relay-signed, fanned-out 30618 falsely attributing the ref state to the
-    // *denied* pusher (`actor = ctx.pusher`), breaking the invariant
-    // "rejected push → no published state".
+    // `ctx.pack.ok` is false when git aborted the ref updates: either the
+    // subprocess exited non-zero (genuine failure) OR — the important case —
+    // a pre-receive hook declined the push. A hook decline does NOT yield a
+    // non-zero exit; `git receive-pack --stateless-rpc` exits 0 and reports
+    // the rejection only in-band as report-status (`ng <ref> <reason>`), which
+    // `run_git_at` folds into `ok` via `receive_pack_report_rejected`. In
+    // either case the workspace refs were NOT advanced, so there is no
+    // committed state to publish: skip the CAS pointer write AND the derived
+    // kind:30618. Otherwise a denied push would emit a relay-signed, fanned-out
+    // 30618 falsely attributing the ref state to the *denied* pusher
+    // (`actor = ctx.pusher`), breaking the invariant "rejected push → no
+    // published state".
     //
     // git's in-band report-status (already buffered in `ctx.pack.stdout`)
     // still streams back so the client prints `! [remote rejected]` / the
@@ -1299,6 +1413,101 @@ mod track_c_tests {
             .sign_with_keys(keys)
             .expect("sign NIP-98 event");
         serde_json::to_string(&event).expect("serialize")
+    }
+
+    fn pkt(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        super::pkt_line(&mut out, payload);
+        out
+    }
+
+    /// Wrap inner status pkt-lines in one side-band-64k band-1 (data) outer
+    /// pkt-line — the real shape git emits when side-band is negotiated:
+    /// `<outer-len>\x01<inner-pkt-lines>`.
+    fn sideband_data(inner_pkts: &[&[u8]]) -> Vec<u8> {
+        let mut inner = vec![0x01u8]; // band 1 = data channel
+        for p in inner_pkts {
+            inner.extend(pkt(p));
+        }
+        pkt(&inner)
+    }
+
+    #[test]
+    fn receive_pack_report_rejected_detects_plain_ng_line() {
+        // No side-band: status pkt-lines at the outer level.
+        let mut out = Vec::new();
+        out.extend(pkt(b"unpack ok\n"));
+        out.extend(pkt(b"ng refs/heads/main pre-receive hook declined\n"));
+        out.extend_from_slice(b"0000");
+
+        assert!(receive_pack_report_rejected(&out));
+    }
+
+    #[test]
+    fn receive_pack_report_rejected_detects_sideband_ng_line() {
+        // Real side-band-64k shape: status pkt-lines NESTED inside a band-1
+        // outer pkt-line. A naive "strip band byte, split on \n" parser misses
+        // this — the rejection surfaces as `0031ng refs/...`.
+        let mut out = sideband_data(&[
+            b"unpack ok\n",
+            b"ng refs/heads/main pre-receive hook declined\n",
+        ]);
+        out.extend_from_slice(b"0000");
+
+        assert!(receive_pack_report_rejected(&out));
+    }
+
+    #[test]
+    fn receive_pack_report_rejected_ignores_ok_status() {
+        // Real side-band-64k success shape — nested `ok` pkt-lines, no `ng`.
+        let mut out = sideband_data(&[b"unpack ok\n", b"ok refs/heads/main\n"]);
+        out.extend_from_slice(b"0000");
+
+        assert!(!receive_pack_report_rejected(&out));
+    }
+
+    #[test]
+    fn receive_pack_report_rejected_matches_real_git_deny_shape() {
+        // Mirrors report-status captured from `git receive-pack` (2.50.1) on a
+        // pre-receive hook decline:
+        //   <band2>policy: denied\n                 (progress/error text)
+        //   <band1>000eunpack ok\n0031ng refs/heads/main pre-receive hook declined\n
+        //   0000
+        // The band-1 payload carries its OWN inner pkt stream — the exact case
+        // a flat parser returns `false` on.
+        let mut out = Vec::new();
+        out.extend(pkt(b"\x02policy: denied\n")); // band 2 = progress/error
+        out.extend(sideband_data(&[
+            b"unpack ok\n",
+            b"ng refs/heads/main pre-receive hook declined\n",
+        ]));
+        out.extend_from_slice(b"0000");
+
+        assert!(
+            receive_pack_report_rejected(&out),
+            "must detect the nested band-1 ng line on a real deny"
+        );
+    }
+
+    #[test]
+    fn receive_pack_report_rejected_ignores_progress_channel_noise() {
+        // A band-2 (progress) line must never be mistaken for a status line,
+        // even if it contained bytes resembling a status — only band-1 counts.
+        let mut out = Vec::new();
+        out.extend(pkt(b"\x02ng-looking progress noise\n")); // band 2 noise
+        out.extend(sideband_data(&[b"unpack ok\n", b"ok refs/heads/main\n"]));
+        out.extend_from_slice(b"0000");
+
+        assert!(!receive_pack_report_rejected(&out));
+    }
+
+    #[test]
+    fn receive_pack_report_rejected_handles_truncated_and_malformed() {
+        // Defensive: malformed length / truncated frame yields no match, never
+        // a panic.
+        assert!(!receive_pack_report_rejected(b""));
+        assert!(!receive_pack_report_rejected(b"zzzz"));
+        assert!(!receive_pack_report_rejected(b"0048")); // length, no payload
     }
 
     #[test]
