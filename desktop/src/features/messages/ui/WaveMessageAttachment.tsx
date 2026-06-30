@@ -40,9 +40,11 @@ export function WaveMessageAttachment({
     ? normalizePubkey(targetPubkey)
     : null;
   const targetAgentPubkey = React.useMemo(() => {
-    if (!targetPubkey || !normalizedTargetPubkey || !agentPubkeys) return null;
+    if (!targetPubkey || !normalizedTargetPubkey) return null;
+    if (targetIsAgent) return targetPubkey;
+    if (!agentPubkeys) return null;
     return agentPubkeys.has(normalizedTargetPubkey) ? targetPubkey : null;
-  }, [agentPubkeys, normalizedTargetPubkey, targetPubkey]);
+  }, [agentPubkeys, normalizedTargetPubkey, targetIsAgent, targetPubkey]);
   const resolvedHuddleMemberPubkeys = React.useMemo(() => {
     if (!targetAgentPubkey) return huddleMemberPubkeys;
     const seen = new Set<string>();
