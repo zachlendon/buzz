@@ -15,7 +15,10 @@ class RelayConfig {
   /// Nostr secret key (bech32 nsec) for signing events and NIP-42 AUTH.
   final String? nsec;
 
-  const RelayConfig({required this.baseUrl, this.nsec});
+  /// API token attached as X-Auth-Token for Blossom media upload.
+  final String? apiToken;
+
+  const RelayConfig({required this.baseUrl, this.nsec, this.apiToken});
 
   /// Derive the websocket URL from the HTTP base URL.
   String get wsUrl {
@@ -46,15 +49,19 @@ class RelayConfigNotifier extends Notifier<RelayConfig> {
     final activeAsync = ref.watch(activeWorkspaceProvider);
     final active = activeAsync.value;
     if (active != null) {
-      return RelayConfig(baseUrl: active.relayUrl, nsec: active.nsec);
+      return RelayConfig(
+        baseUrl: active.relayUrl,
+        nsec: active.nsec,
+        apiToken: active.token,
+      );
     }
 
     // Fallback to compile-time env config (dev mode).
-    return const RelayConfig(baseUrl: Env.relayUrl);
+    return const RelayConfig(baseUrl: Env.relayUrl, apiToken: null);
   }
 
-  void update({required String baseUrl, String? nsec}) {
-    state = RelayConfig(baseUrl: baseUrl, nsec: nsec);
+  void update({required String baseUrl, String? nsec, String? apiToken}) {
+    state = RelayConfig(baseUrl: baseUrl, nsec: nsec, apiToken: apiToken);
   }
 }
 

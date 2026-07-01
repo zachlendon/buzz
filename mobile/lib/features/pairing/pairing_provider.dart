@@ -420,6 +420,7 @@ class PairingNotifier extends Notifier<PairingState> {
       final relayUrl = data['relayUrl'] as String?;
       final pubkey = data['pubkey'] as String?;
       final nsec = data['nsec'] as String?;
+      final token = data['token'] as String?;
 
       if (relayUrl == null) {
         throw const FormatException('Missing relayUrl in payload');
@@ -440,6 +441,7 @@ class PairingNotifier extends Notifier<PairingState> {
         relayUrl: relayUrl,
         pubkey: pubkey,
         nsec: nsec,
+        token: token,
       );
       await ref
           .read(authProvider.notifier)
@@ -616,6 +618,7 @@ class PairingNotifier extends Notifier<PairingState> {
       relayUrl: relayUrl,
       pubkey: decoded['pubkey'] as String?,
       nsec: decoded['nsec'] as String?,
+      token: decoded['token'] as String?,
     );
   }
 

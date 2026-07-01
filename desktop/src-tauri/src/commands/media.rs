@@ -7,7 +7,7 @@ use tauri::State;
 use crate::app_state::AppState;
 use crate::relay::{
     classify_request_error, parse_json_response, relay_api_base_url_with_override,
-    relay_error_message,
+    relay_error_message, workspace_auth_token,
 };
 
 use super::media_transcode::{
@@ -216,12 +216,15 @@ async fn do_upload(
         "Nostr {}",
         URL_SAFE_NO_PAD.encode(auth_event.as_json().as_bytes())
     );
-    let req = state
+    let mut req = state
         .http_client
         .put(format!("{base_url}/media/upload"))
         .header("Authorization", &auth_header)
         .header("Content-Type", mime)
         .header("X-SHA-256", &sha256);
+    if let Some(token) = workspace_auth_token(state) {
+        req = req.header("X-Auth-Token", token);
+    }
 
     // With a progress channel, stream the body in chunks and emit a
     // `media-upload-progress` event as each chunk is handed to the socket,

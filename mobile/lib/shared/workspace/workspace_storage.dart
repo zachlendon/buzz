@@ -43,6 +43,7 @@ class WorkspaceStorage {
         relayUrl: legacyUrl,
         pubkey: legacyPubkey,
         nsec: legacyNsec,
+        token: legacyToken,
       );
 
       await _saveList([workspace]);

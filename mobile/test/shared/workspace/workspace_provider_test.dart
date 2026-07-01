@@ -101,6 +101,62 @@ void main() {
       final activeId = await workspaceStorage.loadActiveId();
       expect(activeId, ws2.id);
     });
+
+    test(
+      'updates duplicate workspace without clearing existing token',
+      () async {
+        container = createContainer();
+        await container.read(workspaceListProvider.future);
+
+        final original = Workspace.create(
+          name: 'Test',
+          relayUrl: 'https://test.example.com',
+          pubkey: 'old-pubkey',
+          nsec: 'old-nsec',
+          token: 'buzz_existing',
+        );
+        final duplicate = Workspace.create(
+          name: 'Test',
+          relayUrl: 'https://test.example.com',
+          pubkey: 'new-pubkey',
+          nsec: 'new-nsec',
+        );
+
+        final notifier = container.read(workspaceListProvider.notifier);
+        await notifier.addWorkspace(original);
+        await notifier.addWorkspace(duplicate);
+
+        final workspaces = await container.read(workspaceListProvider.future);
+        expect(workspaces, hasLength(1));
+        expect(workspaces.first.pubkey, 'new-pubkey');
+        expect(workspaces.first.nsec, 'new-nsec');
+        expect(workspaces.first.token, 'buzz_existing');
+      },
+    );
+
+    test('duplicate workspace updates token when provided', () async {
+      container = createContainer();
+      await container.read(workspaceListProvider.future);
+
+      final original = Workspace.create(
+        name: 'Test',
+        relayUrl: 'https://test.example.com',
+        token: 'buzz_existing',
+      );
+      final duplicate = Workspace.create(
+        name: 'Test',
+        relayUrl: 'https://test.example.com',
+        token: 'buzz_new',
+      );
+
+      final notifier = container.read(workspaceListProvider.notifier);
+      await notifier.addWorkspace(original);
+      await notifier.addWorkspace(duplicate);
+
+      final workspaces = await container.read(workspaceListProvider.future);
+      expect(workspaces, hasLength(1));
+      expect(workspaces.first.token, 'buzz_new');
+    });
   });
 
   group('activeWorkspaceProvider', () {

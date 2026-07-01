@@ -278,6 +278,7 @@ void main() {
       );
       expect(capturedRequest!.headers['Content-Type'], 'image/png');
       expect(capturedRequest!.headers['X-SHA-256'], isNotEmpty);
+      expect(capturedRequest!.headers['X-Auth-Token'], isNull);
       expect(capturedRequest!.bodyBytes, _pngBytes);
 
       final authHeader = capturedRequest!.headers['Authorization'];
@@ -306,6 +307,41 @@ void main() {
         tags,
         anyElement(equals(<String>['server', 'relay.example:8443'])),
       );
+    });
+
+    test('attaches configured API token to uploads', () async {
+      final keychain = nostr.Keys.generate();
+
+      http.Request? capturedRequest;
+      final client = http_testing.MockClient((request) async {
+        capturedRequest = request;
+        return http.Response(
+          jsonEncode({
+            'url': 'https://relay.example/media/test.png',
+            'sha256':
+                '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+            'size': 16,
+            'type': 'image/png',
+            'uploaded': 1,
+          }),
+          200,
+        );
+      });
+
+      final service = MediaUploadService(
+        baseUrl: 'https://relay.example',
+        apiToken: 'buzz_media_token',
+        nsec: keychain.nsec,
+        httpClient: client,
+        pickGalleryVideo: () async => null,
+        pickGalleryImage: () async =>
+            XFile.fromData(_pngBytes, name: 'tiny.png'),
+      );
+
+      await service.pickAndUploadImage();
+
+      expect(capturedRequest, isNotNull);
+      expect(capturedRequest!.headers['X-Auth-Token'], 'buzz_media_token');
     });
 
     test('returns null when the gallery picker is cancelled', () async {

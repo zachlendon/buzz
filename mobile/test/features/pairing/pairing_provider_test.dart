@@ -157,6 +157,7 @@ String _encodePairingCode({
   String relayUrl = 'http://test:3000',
   String? pubkey,
   String? nsec,
+  String? token,
 }) {
   final json = <String, dynamic>{
     'relayUrl': relayUrl,
@@ -164,6 +165,8 @@ String _encodePairingCode({
     if (pubkey != null) 'pubkey': pubkey,
     // ignore: use_null_aware_elements
     if (nsec != null) 'nsec': nsec,
+    // ignore: use_null_aware_elements
+    if (token != null) 'token': token,
   };
   return base64Url.encode(utf8.encode(jsonEncode(json)));
 }

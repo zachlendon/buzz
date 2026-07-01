@@ -176,6 +176,7 @@ void main() {
         expect(loaded.first.relayUrl, 'https://legacy.example.com');
         expect(loaded.first.pubkey, 'legacy_pub');
         expect(loaded.first.nsec, 'legacy_nsec');
+        expect(loaded.first.token, 'legacy_token');
         expect(loaded.first.name, isNotEmpty);
 
         // Legacy keys should be deleted.

@@ -31,6 +31,7 @@ class WorkspaceListNotifier extends AsyncNotifier<List<Workspace>> {
       final updated = existing.copyWith(
         pubkey: workspace.pubkey,
         nsec: workspace.nsec,
+        token: workspace.token ?? existing.token,
       );
       await storage.save(updated);
       final updatedList = [...current];

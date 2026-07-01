@@ -56,6 +56,7 @@ Configuration (flags override env vars):
   BUZZ_RELAY_URL     Relay base URL        [default: http://localhost:3000]
   BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required]
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
+  BUZZ_API_TOKEN     API token for Blossom media upload [optional]
 
 The 'pack' subcommand runs locally and does not require a relay connection.
 
@@ -74,6 +75,10 @@ struct Cli {
     /// NIP-OA auth tag JSON (owner attestation). Injected into every signed event.
     #[arg(long, env = "BUZZ_AUTH_TAG")]
     auth_tag: Option<String>,
+
+    /// API token attached as X-Auth-Token for Blossom media uploads.
+    #[arg(long, env = "BUZZ_API_TOKEN")]
+    api_token: Option<String>,
 
     /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
     #[arg(long, value_enum, default_value = "json")]
@@ -1420,7 +1425,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     }
 
     // Auth: private key is required for all relay operations.
-    // The keypair IS the identity — no tokens, no other auth.
+    // The keypair is the identity for Nostr/WebSocket auth. `BUZZ_API_TOKEN`,
+    // when present, is only attached to Blossom media uploads as an additional
+    // relay-side scope credential.
     let private_key_str = cli.private_key.ok_or_else(|| {
         CliError::Auth("BUZZ_PRIVATE_KEY is required (use --private-key or set env var)".into())
     })?;
@@ -1443,7 +1450,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         _ => (None, None),
     };
 
-    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
+    let api_token = cli
+        .api_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json, api_token)?;
 
     match cli.command {
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
@@ -1521,6 +1534,20 @@ mod tests {
             actual, expected_groups,
             "Command group inventory drift detected"
         );
+    }
+
+    #[test]
+    fn api_token_flag_is_available() {
+        let cmd = Cli::command();
+        let api_token = cmd
+            .get_arguments()
+            .find(|arg| arg.get_id() == "api_token")
+            .expect("global api_token argument should exist");
+
+        assert_eq!(api_token.get_long(), Some("api-token"));
+        assert!(api_token
+            .get_env()
+            .is_some_and(|env| env == "BUZZ_API_TOKEN"));
     }
 
     #[test]

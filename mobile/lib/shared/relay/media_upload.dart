@@ -139,7 +139,7 @@ class MediaUploadService {
     DateTime Function()? now,
     http.Client? httpClient,
   }) : _baseUrl = baseUrl,
-       _apiToken = apiToken,
+       _apiToken = apiToken?.trim(),
        _nsec = nsec,
        _pickGalleryImage = pickGalleryImage,
        _pickGalleryVideo = pickGalleryVideo,
@@ -641,7 +641,7 @@ final mediaUploadServiceProvider = Provider<MediaUploadService>((ref) {
   final picker = ImagePicker();
   final service = MediaUploadService(
     baseUrl: config.baseUrl,
-    apiToken: null,
+    apiToken: config.apiToken,
     nsec: config.nsec,
     pickGalleryImage: () => picker.pickImage(
       source: ImageSource.gallery,

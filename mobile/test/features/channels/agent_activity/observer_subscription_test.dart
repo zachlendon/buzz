@@ -355,11 +355,18 @@ class _FakeRelayConfigNotifier extends RelayConfigNotifier {
   _FakeRelayConfigNotifier({required String? nsec}) : _nsec = nsec;
 
   @override
-  RelayConfig build() =>
-      RelayConfig(baseUrl: 'http://localhost:3000', nsec: _nsec);
+  RelayConfig build() => RelayConfig(
+    baseUrl: 'http://localhost:3000',
+    nsec: _nsec,
+    apiToken: null,
+  );
 
   void setNsec(String? nsec) {
     _nsec = nsec;
-    state = RelayConfig(baseUrl: 'http://localhost:3000', nsec: _nsec);
+    state = RelayConfig(
+      baseUrl: 'http://localhost:3000',
+      nsec: _nsec,
+      apiToken: null,
+    );
   }
 }

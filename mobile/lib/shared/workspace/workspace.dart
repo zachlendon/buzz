@@ -9,6 +9,7 @@ class Workspace {
   final String relayUrl;
   final String? pubkey;
   final String? nsec;
+  final String? token;
   final DateTime addedAt;
 
   const Workspace({
@@ -17,6 +18,7 @@ class Workspace {
     required this.relayUrl,
     this.pubkey,
     this.nsec,
+    this.token,
     required this.addedAt,
   });
 
@@ -25,6 +27,7 @@ class Workspace {
     required String relayUrl,
     String? pubkey,
     String? nsec,
+    String? token,
   }) {
     return Workspace(
       id: _uuid.v4(),
@@ -32,6 +35,7 @@ class Workspace {
       relayUrl: relayUrl,
       pubkey: pubkey,
       nsec: nsec,
+      token: _normalizeToken(token),
       addedAt: DateTime.now(),
     );
   }
@@ -41,6 +45,7 @@ class Workspace {
     String? relayUrl,
     Object? pubkey = _sentinel,
     Object? nsec = _sentinel,
+    Object? token = _sentinel,
   }) {
     return Workspace(
       id: id,
@@ -48,6 +53,9 @@ class Workspace {
       relayUrl: relayUrl ?? this.relayUrl,
       pubkey: pubkey == _sentinel ? this.pubkey : pubkey as String?,
       nsec: nsec == _sentinel ? this.nsec : nsec as String?,
+      token: token == _sentinel
+          ? this.token
+          : _normalizeToken(token as String?),
       addedAt: addedAt,
     );
   }
@@ -58,6 +66,7 @@ class Workspace {
     'relayUrl': relayUrl,
     if (pubkey != null) 'pubkey': pubkey,
     if (nsec != null) 'nsec': nsec,
+    if (token != null) 'token': token,
     'addedAt': addedAt.toIso8601String(),
   };
 
@@ -67,8 +76,14 @@ class Workspace {
     relayUrl: json['relayUrl'] as String,
     pubkey: json['pubkey'] as String?,
     nsec: json['nsec'] as String?,
+    token: _normalizeToken(json['token'] as String?),
     addedAt: DateTime.parse(json['addedAt'] as String),
   );
+
+  static String? _normalizeToken(String? token) {
+    final trimmed = token?.trim();
+    return trimmed == null || trimmed.isEmpty ? null : trimmed;
+  }
 
   /// Derive a human-friendly workspace name from a relay URL.
   static String nameFromUrl(String url) {

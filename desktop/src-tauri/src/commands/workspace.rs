@@ -60,6 +60,7 @@ pub fn validate_repos_dir(dir: String) -> Result<(), String> {
 pub fn apply_workspace(
     relay_url: String,
     nsec: Option<String>,
+    token: Option<String>,
     repos_dir: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
@@ -96,6 +97,17 @@ pub fn apply_workspace(
     {
         let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
         *override_guard = Some(relay_url);
+    }
+    {
+        let mut token_guard = state
+            .auth_token_override
+            .lock()
+            .map_err(|e| e.to_string())?;
+        *token_guard = token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
     }
 
     if let Some(keys) = parsed_keys {

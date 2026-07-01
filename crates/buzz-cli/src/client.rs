@@ -116,6 +116,8 @@ pub struct BuzzClient {
     auth_tag: Option<Tag>,
     /// Raw JSON of the auth tag for the `x-auth-tag` HTTP header.
     auth_tag_json: Option<String>,
+    /// API token attached as `X-Auth-Token` for Blossom media uploads.
+    api_token: Option<String>,
 }
 
 impl BuzzClient {
@@ -124,6 +126,7 @@ impl BuzzClient {
         keys: Keys,
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
+        api_token: Option<String>,
     ) -> Result<Self, CliError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -136,6 +139,11 @@ impl BuzzClient {
             keys,
             auth_tag,
             auth_tag_json,
+            api_token: api_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -375,13 +383,16 @@ impl BuzzClient {
             Duration::from_secs(120)
         };
         let url = format!("{}/media/upload", self.relay_url);
-        let req = self
+        let mut req = self
             .http
             .put(&url)
             .timeout(upload_timeout)
             .header("Authorization", &auth_header)
             .header("Content-Type", &mime)
             .header("X-SHA-256", &sha256);
+        if let Some(token) = self.api_token.as_deref() {
+            req = req.header("X-Auth-Token", token);
+        }
 
         let resp = self.with_auth_tag(req).body(bytes).send().await?;
         if !resp.status().is_success() {

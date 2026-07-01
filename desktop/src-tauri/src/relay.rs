@@ -39,6 +39,18 @@ fn workspace_relay_override(state: &AppState) -> Option<String> {
         .and_then(|guard| guard.clone())
 }
 
+/// Read the workspace API/Blossom auth token override, if set. Returns `None`
+/// when no trimmed token is active or when the mutex is poisoned (best-effort).
+pub fn workspace_auth_token(state: &AppState) -> Option<String> {
+    state.auth_token_override.lock().ok().and_then(|guard| {
+        guard
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Returns the relay WebSocket URL, checking the workspace override first.
 /// Precedence: workspace override > env vars > build-time vars > default.
 pub fn relay_ws_url_with_override(state: &AppState) -> String {
