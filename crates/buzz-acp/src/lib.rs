@@ -2306,10 +2306,12 @@ async fn tokio_main() -> Result<()> {
     // tasks that outlive the grace period are aborted — either way every
     // TaskMeta drops with the pool and its steered_event_ids with it. All
     // in-flight turns are stopping now, so the user-visible contract (eyes
-    // clear when the turn stops) says remove them. No new steer acks can be
-    // recorded after the main loop exits, so draining once here is complete.
-    // Runs concurrently with the grace-period drain; awaited (bounded, each
-    // reaction_remove is internally timeout-capped) before exit.
+    // clear when the turn stops) says remove them. This one-time drain only
+    // covers acks already processed by the SteerAck arm; acks still pending
+    // when the loop exited are handled by drain_crossing_steer_acks below,
+    // after the grace period resolves every watcher. Runs concurrently with
+    // the grace-period drain; awaited (bounded, each reaction_remove is
+    // internally timeout-capped) before exit.
     let steered_cleanup =
         spawn_steered_eyes_cleanup(Some(&ctx.rest_client), pool.drain_all_steered_event_ids());
     // 30 s is generous for in-flight prompts to be cancelled; using
@@ -2365,11 +2367,21 @@ async fn tokio_main() -> Result<()> {
     }
     drop(pool);
 
-    // Wait (bounded) for the steered-👀 cleanup spawned above — each
+    // Resolve success acks that crossed the loop exit (watcher resolved
+    // during the grace period, after `select!` stopped polling). All prompt
+    // tasks have now settled, so every watcher is done or doomed — drop our
+    // sender and drain the channel, then remove the 👀 those events carry.
+    drop(steer_ack_tx);
+    let crossing_cleanup = spawn_steered_eyes_cleanup(
+        Some(&ctx.rest_client),
+        drain_crossing_steer_acks(&mut steer_ack_rx).await,
+    );
+
+    // Wait (bounded) for the steered-👀 cleanups spawned above — each
     // reaction_remove is internally capped at ~2 s of HTTP, so this cannot
     // hang shutdown meaningfully. Best-effort: on timeout the reactions
     // stay stale, same class of loss as any other kill-during-cleanup.
-    if let Some(handle) = steered_cleanup {
+    for handle in [steered_cleanup, crossing_cleanup].into_iter().flatten() {
         if tokio::time::timeout(Duration::from_secs(10), handle)
             .await
             .is_err()
@@ -2720,6 +2732,53 @@ fn spawn_steered_eyes_cleanup(
             pool::reaction_remove(&rest, eid, "👀").await;
         }
     }))
+}
+
+/// Drain `steer_ack_rx` after the main loop has exited and every prompt
+/// task has settled, returning the event ids of `SteerAck::Success` acks
+/// that crossed the loop exit.
+///
+/// A watcher can resolve during the shutdown grace period — after the
+/// `select!` stopped polling `steer_ack_rx` but while its turn's read loop
+/// was still running. Such a Success ack was never seen by the SteerAck
+/// arm: its event id is on no `TaskMeta` (the one-time drain missed it) and
+/// no immediate cleanup fired — without this pass its 👀 would die stale at
+/// process exit.
+///
+/// Caller must drop its `steer_ack_tx` clone first and call this only after
+/// the grace-period drain: with all prompt tasks finished or aborted, every
+/// watcher's oneshot has resolved (or dropped → `RecvError`), so each
+/// watcher sends promptly and releases its sender clone — `recv()` then
+/// yields `None` once the channel empties. The per-recv timeout is a
+/// backstop against a wedged watcher; on timeout we keep what was drained.
+///
+/// Non-Success acks are dropped: their events were released back to the
+/// queue (which is being discarded) — the same stale-👀-at-exit fate as any
+/// queued-but-never-dispatched event, a pre-existing shutdown limitation
+/// owned by the relay-side cleanup.
+async fn drain_crossing_steer_acks(
+    steer_ack_rx: &mut mpsc::UnboundedReceiver<SteerAckEvent>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), steer_ack_rx.recv()).await {
+            Ok(Some(ev)) => {
+                if matches!(ev.ack, Ok(pool::SteerAck::Success)) {
+                    ids.push(ev.event_id);
+                }
+            }
+            Ok(None) => break, // channel closed — every watcher finished
+            Err(_) => {
+                tracing::warn!(
+                    drained = ids.len(),
+                    "steer ack watcher still pending at shutdown deadline — \
+                     proceeding with acks drained so far"
+                );
+                break;
+            }
+        }
+    }
+    ids
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4578,6 +4637,68 @@ mod steered_eyes_lifecycle_tests {
         assert!(spawn_steered_eyes_cleanup(Some(&rest), Vec::new()).is_none());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(captured.lock().await.is_empty());
+    }
+
+    /// Build a `SteerAckEvent` with a real (already-finished) task id.
+    async fn ack_event(event_id: &str, ack: pool::SteerAck) -> SteerAckEvent {
+        let handle = tokio::spawn(async {});
+        let task_id = handle.id();
+        let _ = handle.await;
+        SteerAckEvent {
+            channel_id: Uuid::new_v4(),
+            event_id: event_id.to_string(),
+            task_id,
+            ack: Ok(ack),
+        }
+    }
+
+    /// Crossing-ack shutdown race: a `SteerAck::Success` whose watcher
+    /// resolves after the main loop stopped polling `steer_ack_rx` was
+    /// never attached to any TaskMeta — the post-grace drain must still
+    /// recover its event id (and only Success ids) and remove the 👀 on
+    /// the wire before process exit.
+    #[tokio::test]
+    async fn crossing_success_ack_is_drained_and_cleaned_on_the_wire() {
+        let reaction_id = "5a".repeat(32);
+        let (rest, captured) = spawn_mock_relay(&reaction_id).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SteerAckEvent>();
+        let steered_event = "77".repeat(32);
+        // Watcher resolved during the grace period: Success ack sitting in
+        // the channel, unseen by the (exited) main loop.
+        tx.send(ack_event(&steered_event, pool::SteerAck::Success).await)
+            .unwrap();
+        // Non-Success acks in the same window must be ignored.
+        tx.send(ack_event("ignored", pool::SteerAck::PromptCompletedNeutral).await)
+            .unwrap();
+        drop(tx); // shutdown drops its sender before draining
+
+        let ids = drain_crossing_steer_acks(&mut rx).await;
+        assert_eq!(ids, vec![steered_event]);
+
+        let handle = spawn_steered_eyes_cleanup(Some(&rest), ids)
+            .expect("crossing success ack must spawn cleanup");
+        handle.await.expect("cleanup task must not panic");
+
+        let deletions = captured.lock().await.clone();
+        assert_eq!(deletions.len(), 1);
+        assert_is_deletion_of(&deletions[0], &reaction_id);
+    }
+
+    /// Backstop: a wedged watcher (sender clone alive, never sends) must
+    /// not hang shutdown — the drain times out and keeps what it has.
+    /// Paused time makes the 2 s recv deadline resolve instantly.
+    #[tokio::test(start_paused = true)]
+    async fn crossing_ack_drain_times_out_on_wedged_watcher() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SteerAckEvent>();
+        let done = "99".repeat(32);
+        tx.send(ack_event(&done, pool::SteerAck::Success).await)
+            .unwrap();
+        // `tx` intentionally kept alive: simulates a watcher that never
+        // resolves, so the channel never closes.
+        let ids = drain_crossing_steer_acks(&mut rx).await;
+        assert_eq!(ids, vec![done], "must keep acks drained before timeout");
+        drop(tx);
     }
 }
 
