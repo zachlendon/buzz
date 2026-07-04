@@ -9,7 +9,7 @@ use crate::auth::verify_blossom_upload_auth;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::storage::{
-    BlobMeta, MediaStorage, BUZZ_COMMUNITY_ALIAS_META_KEY, BUZZ_COMMUNITY_ID_META_KEY,
+    BlobMeta, MediaStorage, BUZZ_COMMUNITY_HOST_META_KEY, BUZZ_COMMUNITY_ID_META_KEY,
     BUZZ_UPLOADER_ID_META_KEY, BUZZ_UPLOADER_NAME_META_KEY,
 };
 use crate::thumbnail::generate_image_metadata_sync;
@@ -19,13 +19,13 @@ use crate::validation::{
 };
 
 /// Readability metadata for upload attribution. The id fields remain
-/// authoritative; names/aliases are best-effort labels for moderators.
+/// authoritative; names/hosts are best-effort labels for moderators.
 #[derive(Debug, Clone, Default)]
 pub struct UploadAttributionLabels {
     /// Configured display name for the authenticated uploader, if known.
     pub uploader_name: Option<String>,
-    /// Human-readable alias derived from the server-resolved tenant host.
-    pub community_alias: Option<String>,
+    /// Server-resolved tenant host for the community.
+    pub community_host: Option<String>,
 }
 
 impl UploadAttributionLabels {
@@ -33,7 +33,7 @@ impl UploadAttributionLabels {
     pub fn from_profile_and_host(uploader_name: Option<String>, tenant_host: &str) -> Self {
         Self {
             uploader_name: uploader_name.and_then(sanitize_label),
-            community_alias: community_alias_from_host(tenant_host),
+            community_host: community_host_from_host(tenant_host),
         }
     }
 }
@@ -50,8 +50,8 @@ fn attribution_meta<'a>(
     if let Some(uploader_name) = labels.uploader_name.as_deref() {
         metadata.push((BUZZ_UPLOADER_NAME_META_KEY, uploader_name));
     }
-    if let Some(community_alias) = labels.community_alias.as_deref() {
-        metadata.push((BUZZ_COMMUNITY_ALIAS_META_KEY, community_alias));
+    if let Some(community_host) = labels.community_host.as_deref() {
+        metadata.push((BUZZ_COMMUNITY_HOST_META_KEY, community_host));
     }
     metadata
 }
@@ -82,10 +82,8 @@ fn sanitize_label(label: String) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-fn community_alias_from_host(host: &str) -> Option<String> {
-    let authority = host.split(':').next().unwrap_or(host).trim();
-    let alias = authority.split('.').next().unwrap_or(authority);
-    sanitize_label(alias.to_string())
+fn community_host_from_host(host: &str) -> Option<String> {
+    sanitize_label(host.to_string())
 }
 
 /// Shared buffered-upload pipeline for the image and generic-file paths.
@@ -307,7 +305,7 @@ pub async fn process_file_upload(
                     uploader_id: Some(input.uploader_id),
                     uploader_name: input.labels.uploader_name,
                     community_id: Some(input.community_id),
-                    community_alias: input.labels.community_alias,
+                    community_host: input.labels.community_host,
                 };
                 storage.put_sidecar(ctx, &input.sha256, &meta).await?;
                 Ok(meta)
@@ -514,7 +512,7 @@ pub async fn process_video_upload(
         uploader_id: Some(uploader_id),
         uploader_name: labels.uploader_name,
         community_id: Some(community_id),
-        community_alias: labels.community_alias,
+        community_host: labels.community_host,
     };
     storage.put_sidecar(ctx, &sha256_hex, &meta).await?;
 
@@ -552,7 +550,7 @@ async fn generate_and_store_metadata(
     meta.uploader_id = Some(input.uploader_id);
     meta.uploader_name = input.labels.uploader_name;
     meta.community_id = Some(input.community_id);
-    meta.community_alias = input.labels.community_alias;
+    meta.community_host = input.labels.community_host;
 
     if let Some(ref tb) = thumb_bytes {
         // The thumbnail is a derived object with its own S3 key, so it carries
@@ -568,7 +566,7 @@ async fn generate_and_store_metadata(
                     meta.community_id.as_deref().unwrap_or_default(),
                     &UploadAttributionLabels {
                         uploader_name: meta.uploader_name.clone(),
-                        community_alias: meta.community_alias.clone(),
+                        community_host: meta.community_host.clone(),
                     },
                 ),
             )
@@ -638,7 +636,7 @@ mod tests {
             uploader_id: None,
             uploader_name: None,
             community_id: None,
-            community_alias: None,
+            community_host: None,
         };
 
         let desc = build_descriptor(
@@ -700,7 +698,7 @@ mod tests {
             uploader_id: None,
             uploader_name: None,
             community_id: None,
-            community_alias: None,
+            community_host: None,
         };
 
         let desc = build_descriptor(
@@ -759,18 +757,21 @@ mod tests {
     }
 
     #[test]
-    fn upload_attribution_labels_are_sanitized_and_host_aliased() {
+    fn upload_attribution_labels_are_sanitized_and_use_full_host() {
         let labels = UploadAttributionLabels::from_profile_and_host(
             Some("  Ada Lovelace\n🚀  ".to_string()),
             "moderation.buzz.example",
         );
 
         assert_eq!(labels.uploader_name.as_deref(), Some("Ada Lovelace"));
-        assert_eq!(labels.community_alias.as_deref(), Some("moderation"));
+        assert_eq!(
+            labels.community_host.as_deref(),
+            Some("moderation.buzz.example")
+        );
 
         let localhost = UploadAttributionLabels::from_profile_and_host(None, "localhost:3000");
         assert_eq!(localhost.uploader_name, None);
-        assert_eq!(localhost.community_alias.as_deref(), Some("localhost"));
+        assert_eq!(localhost.community_host.as_deref(), Some("localhost:3000"));
     }
 
     #[test]

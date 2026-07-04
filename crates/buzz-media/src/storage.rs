@@ -22,8 +22,8 @@ pub const BUZZ_UPLOADER_ID_META_KEY: &str = "buzz-uploader-id";
 pub const BUZZ_UPLOADER_NAME_META_KEY: &str = "buzz-uploader-name";
 /// Bare S3 user-metadata key for the server-resolved community id.
 pub const BUZZ_COMMUNITY_ID_META_KEY: &str = "buzz-community-id";
-/// Bare S3 user-metadata key for the human-readable community host prefix.
-pub const BUZZ_COMMUNITY_ALIAS_META_KEY: &str = "buzz-community-alias";
+/// Bare S3 user-metadata key for the server-resolved community host.
+pub const BUZZ_COMMUNITY_HOST_META_KEY: &str = "buzz-community-host";
 
 /// S3-compatible object storage client.
 pub struct MediaStorage {
@@ -407,7 +407,7 @@ mod tests {
             (BUZZ_UPLOADER_ID_META_KEY, "aabbcc"),
             (BUZZ_UPLOADER_NAME_META_KEY, "Ada"),
             (BUZZ_COMMUNITY_ID_META_KEY, "0000-1111"),
-            (BUZZ_COMMUNITY_ALIAS_META_KEY, "moderation"),
+            (BUZZ_COMMUNITY_HOST_META_KEY, "moderation.buzz.example"),
         ])
         .unwrap();
         assert_eq!(
@@ -430,9 +430,9 @@ mod tests {
         );
         assert_eq!(
             headers
-                .get(format!("x-amz-meta-{BUZZ_COMMUNITY_ALIAS_META_KEY}"))
+                .get(format!("x-amz-meta-{BUZZ_COMMUNITY_HOST_META_KEY}"))
                 .unwrap(),
-            "moderation"
+            "moderation.buzz.example"
         );
 
         // Control characters in values are rejected, not silently mangled.
@@ -451,8 +451,8 @@ mod tests {
             "0000-1111".to_string(),
         );
         metadata.insert(
-            BUZZ_COMMUNITY_ALIAS_META_KEY.to_string(),
-            "moderation".to_string(),
+            BUZZ_COMMUNITY_HOST_META_KEY.to_string(),
+            "moderation.buzz.example".to_string(),
         );
 
         let result = s3::serde_types::HeadObjectResult {
@@ -476,8 +476,8 @@ mod tests {
             Some(&"0000-1111".to_string())
         );
         assert_eq!(
-            head.metadata.get(BUZZ_COMMUNITY_ALIAS_META_KEY),
-            Some(&"moderation".to_string())
+            head.metadata.get(BUZZ_COMMUNITY_HOST_META_KEY),
+            Some(&"moderation.buzz.example".to_string())
         );
     }
 
@@ -491,28 +491,28 @@ mod tests {
         assert_eq!(meta.uploader_id, None);
         assert_eq!(meta.uploader_name, None);
         assert_eq!(meta.community_id, None);
-        assert_eq!(meta.community_alias, None);
+        assert_eq!(meta.community_host, None);
 
         // Absent attribution is omitted from serialized output (not null).
         let json = serde_json::to_value(&meta).unwrap();
         assert!(json.get("uploader_id").is_none());
         assert!(json.get("uploader_name").is_none());
         assert!(json.get("community_id").is_none());
-        assert!(json.get("community_alias").is_none());
+        assert!(json.get("community_host").is_none());
 
         // Populated attribution round-trips.
         let meta = BlobMeta {
             uploader_id: Some("aa".repeat(32)),
             uploader_name: Some("Ada".to_string()),
             community_id: Some("6b8e1c2a-0000-0000-0000-000000000000".to_string()),
-            community_alias: Some("moderation".to_string()),
+            community_host: Some("moderation.buzz.example".to_string()),
             ..meta
         };
         let round: BlobMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
         assert_eq!(round.uploader_id, meta.uploader_id);
         assert_eq!(round.uploader_name, meta.uploader_name);
         assert_eq!(round.community_id, meta.community_id);
-        assert_eq!(round.community_alias, meta.community_alias);
+        assert_eq!(round.community_host, meta.community_host);
     }
 }
 
@@ -588,9 +588,8 @@ pub struct BlobMeta {
     /// out of its keyed location; `None` on pre-attribution sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub community_id: Option<String>,
-    /// Human-readable community alias derived from the server-resolved host's
-    /// first label (for example `team` from `team.example.com`). Readability
-    /// hint only; `community_id` remains authoritative.
+    /// Server-resolved community host (for example `team.example.com`).
+    /// Readability hint only; `community_id` remains authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub community_alias: Option<String>,
+    pub community_host: Option<String>,
 }
