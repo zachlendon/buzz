@@ -12,7 +12,10 @@ import {
   useAgentsTranscript,
 } from "@/features/agents/ui/useObserverEvents";
 import { ChatHeader } from "@/features/chat/ui/ChatHeader";
-import { useUpdateChatMetadataMutation } from "@/features/chats/hooks";
+import {
+  useSendChatContextMessageMutation,
+  useUpdateChatMetadataMutation,
+} from "@/features/chats/hooks";
 import {
   buildChatActivityPlacement,
   shouldHidePersistedAgentMessage,
@@ -20,6 +23,7 @@ import {
 import { chatProjectForMetadata } from "@/features/chats/lib/chatProjects";
 import {
   buildChatCanvasContent,
+  deriveBranchTitle,
   buildProjectSetupContext,
   type ChatProject,
   deriveChatTitle,
@@ -30,11 +34,24 @@ import { ChatActivityTranscript } from "@/features/chats/ui/ChatActivityTranscri
 import {
   CHAT_AUTOMATION_TAG,
   chatAutomationTag,
+  clearChatPinnedPr,
 } from "@/features/chats/lib/chatWorkAutomation";
 import {
-  deriveBranchFromAgentMessages,
-  deriveChatWorkBranch,
+  buildChatWorkContext,
+  markChatWorkContextSent,
+  mergeChatWorkBinding,
+  shouldShowChatWorkContextContent,
+  updateChatWorkBinding,
+  useChatWorkBinding,
+  wasChatWorkContextSent,
+} from "@/features/chats/lib/chatWorkBinding";
+import {
+  collectBranchSourcesFromAgentMessages,
+  collectChatWorkBranchSources,
+  deriveBranchSourceFromAgentMessages,
+  deriveChatWorkBranchSource,
 } from "@/features/chats/lib/chatWorkBranch";
+import { collectUnambiguousPullRequestSources } from "@/features/chats/lib/chatWorkLinks";
 import { cancelManagedAgentTurn } from "@/shared/api/agentControl";
 import { ChatWorkPanel } from "@/features/chats/ui/ChatWorkPanel";
 import { isHumanFacingAssistantText } from "@/features/chats/ui/chatActivityText";
@@ -77,6 +94,53 @@ function eventHasTag(event: RelayEvent, name: string, value?: string) {
   return event.tags.some(
     (tag) => tag[0] === name && (value === undefined || tag[1] === value),
   );
+}
+
+function chatContextTimelineRank(event: RelayEvent) {
+  if (!eventHasTag(event, "chat_context", "source")) {
+    return 0;
+  }
+  if (event.content.startsWith("Project setup")) {
+    return -1;
+  }
+  return 1;
+}
+
+function workContextLine(content: string, label: "Branch" | "Pull request") {
+  const match = content.match(new RegExp(`^${label}:\\s*(.+)$`, "m"));
+  return match?.[1]?.trim() || null;
+}
+
+function chatContextVisualTimestampMs({
+  branchAnchors,
+  event,
+  prAnchors,
+}: {
+  branchAnchors: ReadonlyMap<string, number>;
+  event: RelayEvent;
+  prAnchors: ReadonlyMap<string, number>;
+}) {
+  if (!event.content.startsWith("Work context")) {
+    return event.created_at * 1_000;
+  }
+
+  const branch = workContextLine(event.content, "Branch");
+  if (branch) {
+    const branchAnchor = branchAnchors.get(branch);
+    if (branchAnchor !== undefined) {
+      return branchAnchor;
+    }
+  }
+
+  const prHref = workContextLine(event.content, "Pull request");
+  if (prHref) {
+    const prAnchor = prAnchors.get(prHref);
+    if (prAnchor !== undefined) {
+      return prAnchor;
+    }
+  }
+
+  return event.created_at * 1_000;
 }
 
 type ChatDetailProps = {
@@ -126,6 +190,7 @@ export function ChatDetail({
 }: ChatDetailProps) {
   const queryClient = useQueryClient();
   const updateMetadataMutation = useUpdateChatMetadataMutation();
+  const sendContextMutation = useSendChatContextMessageMutation();
   // Every active managed agent, not just the default: a chat can have
   // several agents working and all of their activity must render.
   const managedAgentsQuery = useManagedAgentsQuery();
@@ -179,12 +244,51 @@ export function ChatDetail({
   // Tool activity only exists from subscription time (observer frames are
   // ephemeral), so fall back to the agent's persisted messages, which
   // announce the branch ("…on branch kennylopez-dictation").
-  const workBranch = React.useMemo(
-    () =>
-      deriveChatWorkBranch(scopedTranscript) ??
-      deriveBranchFromAgentMessages(messages, defaultAgent?.pubkey),
-    [defaultAgent?.pubkey, messages, scopedTranscript],
+  const transcriptWorkBranchSource = React.useMemo(
+    () => deriveChatWorkBranchSource(scopedTranscript),
+    [scopedTranscript],
   );
+  const messageWorkBranchSource = React.useMemo(
+    () => deriveBranchSourceFromAgentMessages(messages, defaultAgent?.pubkey),
+    [defaultAgent?.pubkey, messages],
+  );
+  const workBranch =
+    (transcriptWorkBranchSource ?? messageWorkBranchSource)?.branch ?? null;
+  const branchAnchors = React.useMemo(() => {
+    const anchors = new Map<string, number>();
+    const rememberEarliest = (branch: string, timestampMs: number | null) => {
+      if (timestampMs === null) {
+        return;
+      }
+      const current = anchors.get(branch);
+      if (current === undefined || timestampMs < current) {
+        anchors.set(branch, timestampMs);
+      }
+    };
+    for (const source of collectBranchSourcesFromAgentMessages(
+      messages,
+      defaultAgent?.pubkey,
+    )) {
+      rememberEarliest(source.branch, source.timestampMs);
+    }
+    for (const source of collectChatWorkBranchSources(scopedTranscript)) {
+      rememberEarliest(source.branch, source.timestampMs);
+    }
+    return anchors;
+  }, [defaultAgent?.pubkey, messages, scopedTranscript]);
+  const prAnchors = React.useMemo(() => {
+    const anchors = new Map<string, number>();
+    for (const source of collectUnambiguousPullRequestSources(messages)) {
+      if (source.timestampMs === null) {
+        continue;
+      }
+      const current = anchors.get(source.href);
+      if (current === undefined || source.timestampMs < current) {
+        anchors.set(source.href, source.timestampMs);
+      }
+    }
+    return anchors;
+  }, [messages]);
   const handleStopAgent = React.useCallback(() => {
     // Cancel every agent with a live turn in this chat; fall back to the
     // default agent when the turn store hasn't caught up yet.
@@ -208,6 +312,115 @@ export function ChatDetail({
     () => chatProjectForMetadata(metadata),
     [metadata],
   );
+  const workBinding = useChatWorkBinding(chat.id);
+  const projectName =
+    metadata?.projectName?.trim() || selectedProject?.name?.trim() || null;
+  const projectPath =
+    metadata?.projectPath?.trim() || selectedProject?.path?.trim() || null;
+
+  React.useEffect(() => {
+    if (metadata === null) {
+      return;
+    }
+    const hadProject = Boolean(
+      workBinding?.projectName || workBinding?.projectPath,
+    );
+    const projectChanged = Boolean(
+      workBinding &&
+        hadProject &&
+        ((workBinding.projectName ?? "") !== (projectName ?? "") ||
+          (workBinding.projectPath ?? "") !== (projectPath ?? "")),
+    );
+    if (projectChanged) {
+      clearChatPinnedPr(chat.id);
+      updateChatWorkBinding(
+        chat.id,
+        {
+          projectName,
+          projectPath,
+          branch: null,
+          prHref: null,
+          prDetached: false,
+        },
+        { replaceProject: true, replaceBranch: true, replacePr: true },
+      );
+      return;
+    }
+    updateChatWorkBinding(
+      chat.id,
+      { projectName, projectPath },
+      { replaceProject: true },
+    );
+  }, [chat.id, metadata, projectName, projectPath, workBinding]);
+
+  React.useEffect(() => {
+    if (!workBranch) {
+      return;
+    }
+    updateChatWorkBinding(chat.id, { branch: workBranch });
+  }, [chat.id, workBranch]);
+
+  React.useEffect(() => {
+    if (!workPanelHref) {
+      return;
+    }
+    updateChatWorkBinding(chat.id, {
+      prHref: workPanelHref,
+      prDetached: false,
+    });
+  }, [chat.id, workPanelHref]);
+
+  const boundBranch = workBinding?.branch ?? workBranch;
+  const boundPrHref = workBinding?.prDetached
+    ? null
+    : (workBinding?.prHref ?? workPanelHref);
+  const effectiveWorkBinding = React.useMemo(
+    () =>
+      mergeChatWorkBinding(
+        null,
+        {
+          projectName,
+          projectPath,
+          branch: boundBranch,
+          prHref: boundPrHref,
+          prDetached: workBinding?.prDetached ?? false,
+        },
+        { replaceProject: true, replaceBranch: true, replacePr: true },
+      ),
+    [
+      boundBranch,
+      boundPrHref,
+      projectName,
+      projectPath,
+      workBinding?.prDetached,
+    ],
+  );
+  const workContext = React.useMemo(
+    () => buildChatWorkContext(effectiveWorkBinding),
+    [effectiveWorkBinding],
+  );
+  const sendChatContextAsync = sendContextMutation.mutateAsync;
+  React.useEffect(() => {
+    if (!workContext || wasChatWorkContextSent(chat.id, workContext)) {
+      return;
+    }
+    let cancelled = false;
+    void sendChatContextAsync({
+      channelId: chat.id,
+      content: workContext,
+    })
+      .then(() => {
+        if (!cancelled) {
+          markChatWorkContextSent(chat.id, workContext);
+        }
+      })
+      .catch((error) => {
+        console.warn("Failed to send chat work context", chat.id, error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [chat.id, sendChatContextAsync, workContext]);
   const handleSelectProject = React.useCallback(
     async (projectId: string | null) => {
       const nextProject =
@@ -259,6 +472,13 @@ export function ChatDetail({
           queryKey: ["channel-canvas", chat.id],
         });
 
+        if (leadingContent) {
+          await sendChatContextAsync({
+            channelId: chat.id,
+            content: leadingContent,
+          });
+        }
+
         if (nextProject) {
           onProjectCreated({
             ...nextProject,
@@ -285,39 +505,64 @@ export function ChatDetail({
       onProjectCreated,
       projects,
       queryClient,
+      sendChatContextAsync,
       templates,
       updateMetadataMutation,
     ],
   );
   const visibleMessages = React.useMemo(
     () =>
-      messages.filter((message) => {
-        // Only true message kinds render: the channel query also delivers
-        // reactions/edits/deletions (kind 7 et al.), and a stray agent 👀
-        // reaction otherwise renders as a tiny emoji bubble.
-        if (
-          !CHANNEL_MESSAGE_EVENT_KINDS.includes(
-            message.kind as (typeof CHANNEL_MESSAGE_EVENT_KINDS)[number],
-          )
-        ) {
-          return false;
-        }
-        // NOTE: no narration heuristics here. A persisted agent message was
-        // deliberately SENT to the channel — filtering it through the
-        // transcript's internal-narration patterns dropped real replies
-        // ("Done! I've sent the summary…"), leaving turns that visibly
-        // worked but never answered. Narration shaping belongs to the
-        // activity transcript; persisted rows only dedup against it.
-        return (
-          (eventHasTag(message, "chat_context", "source") ||
-            message.content.trim().length > 0) &&
-          !shouldHidePersistedAgentMessage({
-            event: message,
-            hiddenAgentMessageIds: chatActivity.hiddenAgentMessageIds,
-          })
-        );
-      }),
-    [chatActivity.hiddenAgentMessageIds, messages],
+      messages
+        .filter((message) => {
+          // Only true message kinds render: the channel query also delivers
+          // reactions/edits/deletions (kind 7 et al.), and a stray agent 👀
+          // reaction otherwise renders as a tiny emoji bubble.
+          if (
+            !CHANNEL_MESSAGE_EVENT_KINDS.includes(
+              message.kind as (typeof CHANNEL_MESSAGE_EVENT_KINDS)[number],
+            )
+          ) {
+            return false;
+          }
+          // NOTE: no narration heuristics here. A persisted agent message was
+          // deliberately SENT to the channel — filtering it through the
+          // transcript's internal-narration patterns dropped real replies
+          // ("Done! I've sent the summary…"), leaving turns that visibly
+          // worked but never answered. Narration shaping belongs to the
+          // activity transcript; persisted rows only dedup against it.
+          return (
+            (eventHasTag(message, "chat_context", "source") ||
+              message.content.trim().length > 0) &&
+            shouldShowChatWorkContextContent(message.content, workContext) &&
+            !shouldHidePersistedAgentMessage({
+              event: message,
+              hiddenAgentMessageIds: chatActivity.hiddenAgentMessageIds,
+            })
+          );
+        })
+        .sort((left, right) => {
+          const leftTimestampMs = chatContextVisualTimestampMs({
+            branchAnchors,
+            event: left,
+            prAnchors,
+          });
+          const rightTimestampMs = chatContextVisualTimestampMs({
+            branchAnchors,
+            event: right,
+            prAnchors,
+          });
+          if (leftTimestampMs !== rightTimestampMs) {
+            return leftTimestampMs - rightTimestampMs;
+          }
+          return chatContextTimelineRank(left) - chatContextTimelineRank(right);
+        }),
+    [
+      branchAnchors,
+      chatActivity.hiddenAgentMessageIds,
+      messages,
+      prAnchors,
+      workContext,
+    ],
   );
   const hasTranscriptActivity = chatActivity.totalBlockCount > 0;
 
@@ -349,9 +594,9 @@ export function ChatDetail({
   }, [defaultAgent?.pubkey, identityPubkey, messages]);
 
   // Auto-title: upgrade a still-default title (the first message, verbatim)
-  // to a succinct subject line. Prefers the agent-generated `chat_title`
-  // observer frame — the harness titles the conversation with a real model —
-  // and falls back to the local heuristic once the conversation develops.
+  // to a succinct subject line. A branch name is the strongest signal for
+  // work chats; otherwise prefer the agent-generated `chat_title` observer
+  // frame and fall back to the local heuristic once the conversation develops.
   // Never touches a manually renamed chat, and skips shared chats we don't
   // own.
   const agentChatTitle = useAgentChatTitle(chat.id);
@@ -381,19 +626,34 @@ export function ChatDetail({
       return;
     }
 
+    const branchTitle = deriveBranchTitle(boundBranch);
+    const branchAutoTitles = new Set<string>();
+    if (branchTitle) {
+      branchAutoTitles.add(branchTitle);
+    }
+    for (const branch of branchAnchors.keys()) {
+      const candidate = deriveBranchTitle(branch);
+      if (candidate) {
+        branchAutoTitles.add(candidate);
+      }
+    }
+
     // Auto titles are the ones this flow (or chat creation) produced; any
     // other value is a manual rename we must never override.
     const isAutoTitle =
       metadata.title === "New chat" ||
       metadata.title === deriveChatTitle(firstOwnMessage.content) ||
-      metadata.title === deriveConversationTitle(firstOwnMessage.content);
+      metadata.title === deriveConversationTitle(firstOwnMessage.content) ||
+      branchAutoTitles.has(metadata.title);
     if (!isAutoTitle) {
       return;
     }
 
     let nextTitle: string | null = null;
     let isHeuristicTitle = false;
-    if (agentChatTitle && agentChatTitle.trim().length > 0) {
+    if (branchTitle) {
+      nextTitle = branchTitle;
+    } else if (agentChatTitle && agentChatTitle.trim().length > 0) {
       nextTitle = agentChatTitle.trim();
     } else if (!heuristicRetitledChatIdsRef.current.has(chat.id)) {
       // Heuristic fallback. Retitling right after the first reply feels
@@ -460,6 +720,8 @@ export function ChatDetail({
     });
   }, [
     agentChatTitle,
+    boundBranch,
+    branchAnchors,
     chat.id,
     defaultAgent?.pubkey,
     identityPubkey,
@@ -484,21 +746,7 @@ export function ChatDetail({
     latestVisibleMessageIsOwn &&
     latestMessageActivityBlocks.length === 0 &&
     !isChatTurnActive;
-  const activationDelayKey =
-    latestVisibleMessage != null
-      ? `${latestVisibleMessage.id}:${scopedTranscript.length}`
-      : "";
-  const [showDelayedActivationCard, setShowDelayedActivationCard] =
-    React.useState(false);
-  // A just-activated agent needs time to spawn, connect, replay the pending
-  // message, and start its turn. Without this grace window the card re-shows
-  // ~1s after activation and reads as "activation didn't work".
-  const AGENT_ACTIVATION_GRACE_MS = 20_000;
-  // "Activated" isn't done until the agent responds: the card's button holds
-  // its loading state from click until this chat has a live turn (the card
-  // unmounts then) or the give-up window expires — the start API returning
-  // only means the process launched, not that it's connected and replaying
-  // the pending message.
+  // Keep activation pending until a live turn appears or the wait expires.
   const ACTIVATION_PENDING_MS = 60_000;
   const [isActivationPending, setIsActivationPending] = React.useState(false);
   const handleActivateAgent = React.useCallback(() => {
@@ -523,11 +771,13 @@ export function ChatDetail({
     [defaultAgent, onActivateAgent, onSend],
   );
 
+  const defaultAgentActive =
+    defaultAgent != null && isManagedAgentActive(defaultAgent);
   React.useEffect(() => {
     if (!isActivationPending) {
       return;
     }
-    if (isChatTurnActive) {
+    if (isChatTurnActive || defaultAgentActive) {
       setIsActivationPending(false);
       return;
     }
@@ -535,40 +785,12 @@ export function ChatDetail({
       setIsActivationPending(false);
     }, ACTIVATION_PENDING_MS);
     return () => window.clearTimeout(timeout);
-  }, [isActivationPending, isChatTurnActive]);
-  const [activationGraceUntil, setActivationGraceUntil] = React.useState(0);
-  const wasActivatingRef = React.useRef(false);
-  React.useEffect(() => {
-    if (wasActivatingRef.current && !isActivatingAgent) {
-      setActivationGraceUntil(Date.now() + AGENT_ACTIVATION_GRACE_MS);
-    }
-    wasActivatingRef.current = isActivatingAgent;
-  }, [isActivatingAgent]);
-  React.useEffect(() => {
-    if (!activationDelayKey || !latestOwnMessageNeedsAgent || !hasObserver) {
-      setShowDelayedActivationCard(false);
-      return;
-    }
-
-    const delayMs = Math.max(1_200, activationGraceUntil - Date.now());
-    const timeout = window.setTimeout(() => {
-      setShowDelayedActivationCard(true);
-    }, delayMs);
-    return () => window.clearTimeout(timeout);
-  }, [
-    activationDelayKey,
-    activationGraceUntil,
-    hasObserver,
-    latestOwnMessageNeedsAgent,
-  ]);
-  // A stopped default agent always shows the card — "is it running, is it
-  // silent?" must never be ambiguous. The delayed path still covers a
-  // running-but-unresponsive agent.
-  const defaultAgentInactive =
-    defaultAgent != null && !isManagedAgentActive(defaultAgent);
+  }, [defaultAgentActive, isActivationPending, isChatTurnActive]);
+  // A stopped default agent always shows the card.
+  const defaultAgentInactive = defaultAgent != null && !defaultAgentActive;
   const shouldShowAgentActivationCard =
     (defaultAgentInactive && latestVisibleMessage != null) ||
-    (latestOwnMessageNeedsAgent && (!hasObserver || showDelayedActivationCard));
+    (!defaultAgentActive && latestOwnMessageNeedsAgent && !hasObserver);
   const forceScrollSignature = latestVisibleMessageIsOwn
     ? latestVisibleMessage.id
     : null;
@@ -762,12 +984,12 @@ export function ChatDetail({
         </div>
         <ChatWorkPanel
           agentName={defaultAgent?.name ?? "Fizz"}
-          branch={workBranch}
+          branch={boundBranch}
           chatId={chat.id}
           isTurnActive={isChatTurnActive}
           onAutomationPrompt={handleAutomationPrompt}
           open={showWorkPanel}
-          prHref={workPanelHref}
+          prHref={boundPrHref}
           projectPath={metadata?.projectPath ?? selectedProject?.path ?? null}
         />
       </div>

@@ -13,6 +13,10 @@ export type ChatLinkInput = {
   title?: string | null;
 };
 
+export type DualOpenChatLinkInput = ChatLinkInput & {
+  fallbackMessageId?: string | null;
+};
+
 type ParseChatRouteLinkOptions = {
   currentOrigin?: string | null;
 };
@@ -38,6 +42,30 @@ export function buildChatLink(input: ChatLinkInput): string {
     params.set("title", title);
   }
   return `${CHAT_LINK_SCHEME}//${CHAT_LINK_HOST}?${params.toString()}`;
+}
+
+/**
+ * Build a link that opens as a chat on chat-capable builds and still opens the
+ * underlying private channel on older builds that only understand
+ * `buzz://message`.
+ */
+export function buildDualOpenChatLink(input: DualOpenChatLinkInput): string {
+  if (!input.fallbackMessageId) {
+    return buildChatLink(input);
+  }
+  if (!input.chatId) {
+    throw new Error("buildDualOpenChatLink: chatId is required");
+  }
+
+  const params = new URLSearchParams();
+  params.set("channel", input.chatId);
+  params.set("id", input.fallbackMessageId);
+  params.set("chat", "1");
+  const title = input.title?.trim();
+  if (title) {
+    params.set("title", title);
+  }
+  return `${CHAT_LINK_SCHEME}//message?${params.toString()}`;
 }
 
 export function parseChatLink(url: string): ChatLinkParseResult {

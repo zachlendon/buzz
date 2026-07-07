@@ -1,5 +1,12 @@
 import * as React from "react";
-import { Bot, FolderGit2, MessageCircle, Power, Wand2 } from "lucide-react";
+import {
+  Bot,
+  FolderGit2,
+  GitPullRequest,
+  MessageCircle,
+  Power,
+  Wand2,
+} from "lucide-react";
 
 import { chatAutomationLabel } from "@/features/chats/lib/chatWorkAutomation";
 import { cleanAssistantMessageText } from "@/features/chats/ui/chatActivityText";
@@ -209,8 +216,12 @@ export function ChatAutomationRow({
 
 export function ChatContextRow({ event }: { event: RelayEvent }) {
   const isProjectSetup = event.content.startsWith("Project setup");
+  const isWorkContext = event.content.startsWith("Work context");
   const projectSetupContent = event.content
     .replace(/^Project setup\s*\n?/, "")
+    .trim();
+  const workContextContent = event.content
+    .replace(/^Work context\s*\n?/, "")
     .trim();
 
   if (isProjectSetup) {
@@ -226,6 +237,26 @@ export function ChatContextRow({ event }: { event: RelayEvent }) {
             </Marker>
             <div className="mt-2 rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-sm">
               <Markdown content={projectSetupContent || event.content} />
+            </div>
+          </div>
+        </MessageContent>
+      </Message>
+    );
+  }
+
+  if (isWorkContext) {
+    return (
+      <Message side="left">
+        <MessageContent className="w-full max-w-full">
+          <div className="max-w-2xl">
+            <Marker>
+              <MarkerIcon>
+                <GitPullRequest />
+              </MarkerIcon>
+              <MarkerContent>Work context</MarkerContent>
+            </Marker>
+            <div className="mt-2 rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-sm">
+              <Markdown content={workContextContent || event.content} />
             </div>
           </div>
         </MessageContent>

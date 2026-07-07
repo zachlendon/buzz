@@ -483,7 +483,10 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE scheduled_workflow_fires"));
-        assert!(migrations[0].sql.as_str().contains("CREATE TABLE audit_log"));
+        assert!(migrations[0]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE audit_log"));
         assert!(migrations[0]
             .sql
             .as_str()

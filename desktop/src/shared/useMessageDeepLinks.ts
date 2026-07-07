@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { resolveChatOpenDestination } from "@/features/chats/lib/chatOpenDestination";
 import {
   listenForChatDeepLinks,
   listenForMessageDeepLinks,
@@ -18,23 +19,40 @@ import {
  * first time the listener mounts. Message routing matches the in-app
  * buzz:// handler in `markdown.tsx`: use `goChannel` with `messageId` and
  * let the channel route's existing scroll-into-view + getEventById backfill
- * resolve the target. Chat routing uses the chats route directly.
+ * resolve the target. Chat routing prefers the chats route, then falls back
+ * to the underlying private channel when chat metadata is unavailable.
  */
 export function useMessageDeepLinks() {
   const { goChannel, goChat } = useAppNavigation();
 
   React.useEffect(() => {
     let cancelled = false;
+    const openChatOrChannel = async (channelId: string) => {
+      const destination = await resolveChatOpenDestination(channelId);
+      if (cancelled) return;
+      if (destination.kind === "chat") {
+        void goChat(destination.chatId);
+      } else {
+        void goChannel(destination.channelId);
+      }
+    };
     const unlistenMessagePromise = listenForMessageDeepLinks((payload) => {
       if (cancelled) return;
-      void goChannel(payload.channelId, {
-        messageId: payload.messageId,
-        threadRootId: payload.threadRootId,
+      void resolveChatOpenDestination(payload.channelId).then((destination) => {
+        if (cancelled) return;
+        if (destination.kind === "chat") {
+          void goChat(destination.chatId);
+          return;
+        }
+        void goChannel(destination.channelId, {
+          messageId: payload.messageId,
+          threadRootId: payload.threadRootId,
+        });
       });
     });
     const unlistenChatPromise = listenForChatDeepLinks((payload) => {
       if (cancelled) return;
-      void goChat(payload.chatId);
+      void openChatOrChannel(payload.chatId);
     });
     return () => {
       cancelled = true;

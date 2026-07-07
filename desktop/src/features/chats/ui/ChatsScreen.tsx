@@ -10,6 +10,7 @@ import {
   useManagedAgentsQuery,
   useStartManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useChannelTemplatesQuery } from "@/features/channel-templates/hooks";
 import {
   useArchiveChatMutation,
@@ -25,6 +26,7 @@ import {
   toggleStoredChatPin,
   useStoredChatPins,
 } from "@/features/chats/lib/chatPinStorage";
+import { latestUnambiguousPullRequestHref } from "@/features/chats/lib/chatWorkLinks";
 import {
   mergeChatProjects,
   upsertStoredChatProject,
@@ -49,7 +51,6 @@ import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { addChannelMembers, getCanvas, setCanvas } from "@/shared/api/tauri";
-import { extractSupportedLinkPreviews } from "@/shared/lib/linkPreview";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { getMentionTagPubkey } from "@/shared/lib/resolveMentionNames";
@@ -326,16 +327,10 @@ export function ChatsScreen({
   // toggle and the top-right work module. Author-scoping this proved too
   // brittle (agents added to the chat aren't necessarily in the viewer's
   // managed list), and a PR link dropped by a human is the chat's work too.
+  // Mixed status messages that mention several PRs are not reliable
+  // chat-to-PR ownership signals.
   const agentPullRequestHref = React.useMemo(() => {
-    for (let index = messages.length - 1; index >= 0; index--) {
-      const preview = extractSupportedLinkPreviews(
-        messages[index].content,
-      ).find((candidate) => candidate.kind === "github-pull-request");
-      if (preview) {
-        return preview.href;
-      }
-    }
-    return null;
+    return latestUnambiguousPullRequestHref(messages);
   }, [messages]);
   // The drawer's open state is a single persisted preference — switching
   // chats must NOT reset it or re-derive it (auto-open-on-PR re-animated
@@ -525,10 +520,7 @@ export function ChatsScreen({
     try {
       if (defaultAgent) {
         await addBotToChat(selectedChat.id, defaultAgent.pubkey);
-        if (
-          defaultAgent.status !== "running" &&
-          defaultAgent.status !== "deployed"
-        ) {
+        if (!isManagedAgentActive(defaultAgent)) {
           // No success toast: the process starting is not the same as the
           // agent responding — the activation card holds its loading state
           // until the agent's turn actually begins.
@@ -651,17 +643,13 @@ export function ChatsScreen({
                     }
                     aria-pressed={isWorkPanelOpen}
                     data-testid="toggle-work-panel"
+                    className={cn(isWorkPanelOpen && "bg-accent")}
                     onClick={() => handleWorkPanelPreference(!isWorkPanelOpen)}
                     size="icon"
                     type="button"
                     variant="ghost"
                   >
-                    <GitPullRequest
-                      className={cn(
-                        "h-4 w-4",
-                        isWorkPanelOpen && "text-primary",
-                      )}
-                    />
+                    <GitPullRequest className="h-4 w-4" />
                   </Button>
                 }
               />

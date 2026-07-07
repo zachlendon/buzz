@@ -15,6 +15,7 @@ import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import type { ParsedChatLink } from "@/features/chats/lib/chatLink";
+import { resolveChatOpenDestination } from "@/features/chats/lib/chatOpenDestination";
 import remarkChatLinks from "@/features/chats/lib/remarkChatLinks";
 import type { ParsedMessageLink } from "@/features/messages/lib/messageLink";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
@@ -1944,25 +1945,39 @@ function MarkdownInner({
   );
   const onOpenMessageLink = React.useCallback(
     (link: ParsedMessageLink) => {
-      // Always route through `goChannel` with `messageId` set: the channel
-      // route already handles scroll-into-view + highlight via
+      // Message links to chat-backed channels open in Chats on builds that
+      // understand chat metadata. Other message links route through
+      // `goChannel` with `messageId` set: the channel route already handles
+      // scroll-into-view + highlight via
       // `useAnchoredScroll` + `getEventById` backfill, and works for
       // both stream-message replies and forum threads. Detecting "the thread
       // root is a forum post" up front would require an event lookup we don't
       // currently have synchronously; the brief explicitly allows skipping
       // that detection and falling through.
-      void goChannel(link.channelId, {
-        messageId: link.messageId,
-        threadRootId: link.threadRootId,
+      void resolveChatOpenDestination(link.channelId).then((destination) => {
+        if (destination.kind === "chat") {
+          void goChat(destination.chatId);
+          return;
+        }
+        void goChannel(destination.channelId, {
+          messageId: link.messageId,
+          threadRootId: link.threadRootId,
+        });
       });
     },
-    [goChannel],
+    [goChannel, goChat],
   );
   const onOpenChatLink = React.useCallback(
     (link: ParsedChatLink) => {
-      void goChat(link.chatId);
+      void resolveChatOpenDestination(link.chatId).then((destination) => {
+        if (destination.kind === "chat") {
+          void goChat(destination.chatId);
+        } else {
+          void goChannel(destination.channelId);
+        }
+      });
     },
-    [goChat],
+    [goChannel, goChat],
   );
   const linkPreviews = React.useMemo(
     () => (interactive ? extractSupportedLinkPreviews(content) : []),

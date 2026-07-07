@@ -11,7 +11,18 @@ import { getToolString } from "@/features/agents/ui/agentSessionUtils";
 export function deriveChatWorkBranch(
   transcript: readonly TranscriptItem[],
 ): string | null {
-  let branch: string | null = null;
+  return deriveChatWorkBranchSource(transcript)?.branch ?? null;
+}
+
+export type ChatWorkBranchSource = {
+  branch: string;
+  timestampMs: number | null;
+};
+
+export function collectChatWorkBranchSources(
+  transcript: readonly TranscriptItem[],
+): ChatWorkBranchSource[] {
+  const sources: ChatWorkBranchSource[] = [];
   for (const item of transcript) {
     if (item.type !== "tool") {
       continue;
@@ -22,10 +33,20 @@ export function deriveChatWorkBranch(
     }
     const parsed = parseBranchFromCommand(command);
     if (parsed) {
-      branch = parsed;
+      sources.push({
+        branch: parsed,
+        timestampMs: timestampToMs(item.timestamp),
+      });
     }
   }
-  return branch;
+  return sources;
+}
+
+export function deriveChatWorkBranchSource(
+  transcript: readonly TranscriptItem[],
+): ChatWorkBranchSource | null {
+  const sources = collectChatWorkBranchSources(transcript);
+  return sources[sources.length - 1] ?? null;
 }
 
 /**
@@ -36,25 +57,48 @@ export function deriveChatWorkBranch(
  * commands in the text; the last mention across the messages wins.
  */
 export function deriveBranchFromAgentMessages(
-  messages: readonly { pubkey: string; content: string }[],
+  messages: readonly { pubkey: string; content: string; created_at?: number }[],
   agentPubkey: string | null | undefined,
 ): string | null {
+  return (
+    deriveBranchSourceFromAgentMessages(messages, agentPubkey)?.branch ?? null
+  );
+}
+
+export function collectBranchSourcesFromAgentMessages(
+  messages: readonly { pubkey: string; content: string; created_at?: number }[],
+  agentPubkey: string | null | undefined,
+): ChatWorkBranchSource[] {
   if (!agentPubkey) {
-    return null;
+    return [];
   }
-  let branch: string | null = null;
+  const sources: ChatWorkBranchSource[] = [];
   for (const message of messages) {
     if (message.pubkey !== agentPubkey) {
       continue;
     }
     const parsed =
       parseBranchFromCommand(message.content) ??
-      parseBranchFromProse(message.content);
+      parseSingleBranchFromProse(message.content);
     if (parsed) {
-      branch = parsed;
+      sources.push({
+        branch: parsed,
+        timestampMs:
+          typeof message.created_at === "number"
+            ? message.created_at * 1_000
+            : null,
+      });
     }
   }
-  return branch;
+  return sources;
+}
+
+export function deriveBranchSourceFromAgentMessages(
+  messages: readonly { pubkey: string; content: string; created_at?: number }[],
+  agentPubkey: string | null | undefined,
+): ChatWorkBranchSource | null {
+  const sources = collectBranchSourcesFromAgentMessages(messages, agentPubkey);
+  return sources[sources.length - 1] ?? null;
 }
 
 const PROSE_BRANCH_PATTERNS = [
@@ -62,8 +106,8 @@ const PROSE_BRANCH_PATTERNS = [
   /\bbranch\s+[`'"]([A-Za-z0-9._/-]+)[`'"]/i,
 ];
 
-function parseBranchFromProse(text: string): string | null {
-  let branch: string | null = null;
+function parseSingleBranchFromProse(text: string): string | null {
+  const branches: string[] = [];
   for (const pattern of PROSE_BRANCH_PATTERNS) {
     const flags = pattern.flags.includes("g")
       ? pattern.flags
@@ -72,11 +116,13 @@ function parseBranchFromProse(text: string): string | null {
     for (const match of text.matchAll(global)) {
       const candidate = match[1];
       if (candidate && !looksLikeSha(candidate)) {
-        branch = candidate;
+        branches.push(candidate);
       }
     }
   }
-  return branch;
+
+  const uniqueBranches = [...new Set(branches)];
+  return uniqueBranches.length === 1 ? uniqueBranches[0] : null;
 }
 
 /** Latest branch named by any segment of a (possibly compound) command. */
@@ -175,6 +221,14 @@ function isPlausibleBranchName(token: string): boolean {
 
 function looksLikeSha(token: string): boolean {
   return /^[0-9a-f]{7,40}$/i.test(token);
+}
+
+function timestampToMs(timestamp: string | undefined): number | null {
+  if (!timestamp) {
+    return null;
+  }
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function tokenize(segment: string): string[] {

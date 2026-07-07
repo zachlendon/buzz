@@ -112,9 +112,15 @@ export function updateChatWorkAutomation(
 }
 
 export function useChatWorkAutomation(chatId: string): ChatWorkAutomation {
-  const [state, setState] = React.useState(() =>
-    readChatWorkAutomation(chatId),
-  );
+  const [state, setState] = React.useState<{
+    chatId: string;
+    automation: ChatWorkAutomation;
+  }>(() => ({
+    chatId,
+    automation: readChatWorkAutomation(chatId),
+  }));
+  const automation =
+    state.chatId === chatId ? state.automation : readChatWorkAutomation(chatId);
 
   React.useEffect(() => {
     // Content-compare: a fresh object per storage event would re-run every
@@ -122,14 +128,16 @@ export function useChatWorkAutomation(chatId: string): ChatWorkAutomation {
     const refresh = () =>
       setState((current) => {
         const next = readChatWorkAutomation(chatId);
-        return current.autoFixCi === next.autoFixCi &&
-          current.addressComments === next.addressComments &&
-          current.lastCiNudgeSha === next.lastCiNudgeSha &&
-          current.lastCommentNudgeCount === next.lastCommentNudgeCount &&
-          current.lastCiNudgeAt === next.lastCiNudgeAt &&
-          current.lastCommentNudgeAt === next.lastCommentNudgeAt
+        return current.chatId === chatId &&
+          current.automation.autoFixCi === next.autoFixCi &&
+          current.automation.addressComments === next.addressComments &&
+          current.automation.lastCiNudgeSha === next.lastCiNudgeSha &&
+          current.automation.lastCommentNudgeCount ===
+            next.lastCommentNudgeCount &&
+          current.automation.lastCiNudgeAt === next.lastCiNudgeAt &&
+          current.automation.lastCommentNudgeAt === next.lastCommentNudgeAt
           ? current
-          : next;
+          : { chatId, automation: next };
       });
     refresh();
     window.addEventListener(STORAGE_EVENT, refresh);
@@ -140,7 +148,7 @@ export function useChatWorkAutomation(chatId: string): ChatWorkAutomation {
     };
   }, [chatId]);
 
-  return state;
+  return automation;
 }
 
 const PR_STORAGE_PREFIX = "buzz:chat-work-pr:v1";
@@ -201,6 +209,17 @@ export function writeChatPinnedPr(
       `${PR_STORAGE_PREFIX}:${chatId}`,
       JSON.stringify({ href, manual }),
     );
+  } catch {
+    // Best-effort.
+  }
+}
+
+export function clearChatPinnedPr(chatId: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(`${PR_STORAGE_PREFIX}:${chatId}`);
   } catch {
     // Best-effort.
   }

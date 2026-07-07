@@ -96,6 +96,46 @@ export function deriveConversationTitle(content: string) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+const OWNER_BRANCH_PREFIXES = ["kennylopez", "kennethlopez", "kenneth"];
+const WORK_BRANCH_PREFIX_PATTERN =
+  /^(?:feat|feature|fix|bugfix|bug|chore|docs?|tests?|refactor|cleanup|wip|hotfix|release|task|work)[-_.]+/i;
+
+export function deriveBranchTitle(branch: string | null | undefined) {
+  let text = branch?.trim() ?? "";
+  if (!text) {
+    return null;
+  }
+
+  text = text
+    .replace(/^refs\/heads\//i, "")
+    .replace(/^remotes\//i, "")
+    .replace(/^origin\//i, "");
+  text = text.split("/").filter(Boolean).pop() ?? text;
+
+  for (const prefix of OWNER_BRANCH_PREFIXES) {
+    const pattern = new RegExp(`^${prefix}[-_.]+`, "i");
+    text = text.replace(pattern, "");
+  }
+
+  let previous = "";
+  while (previous !== text) {
+    previous = text;
+    text = text.replace(WORK_BRANCH_PREFIX_PATTERN, "");
+  }
+
+  text = text
+    .replace(/^[A-Z]+-\d+[-_.]+/i, "")
+    .replace(/[-_.]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (text.length < MIN_CONVERSATION_TITLE_CHARS) {
+    return null;
+  }
+
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export function uniqueMentionPubkeys(
   identityPubkey: string | undefined,
   mentionPubkeys: string[],

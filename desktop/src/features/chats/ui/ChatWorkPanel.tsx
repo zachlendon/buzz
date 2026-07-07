@@ -13,12 +13,17 @@ import {
 
 import {
   CHAT_PR_UNPINNED,
+  clearChatPinnedPr,
   type ChatPinnedPr,
   readChatPinnedPr,
   updateChatWorkAutomation,
   useChatWorkAutomation,
   writeChatPinnedPr,
 } from "@/features/chats/lib/chatWorkAutomation";
+import {
+  clearChatWorkBindingPr,
+  updateChatWorkBinding,
+} from "@/features/chats/lib/chatWorkBinding";
 import {
   type GithubCheckSummary,
   parseGithubPullRequestRef,
@@ -50,6 +55,11 @@ const lastShownPrByChat = new Map<string, string>();
 // automation re-nudges after this cooldown — the earlier nudge may have
 // landed while the agent was stopped or the message failed to take.
 const RENUDGE_COOLDOWN_MS = 15 * 60_000;
+
+type PinnedPrState = {
+  chatId: string;
+  pinned: ChatPinnedPr | null;
+};
 
 /**
  * Right-hand work drawer for a chat: branch, live PR card, and a CI monitor
@@ -94,40 +104,62 @@ export function ChatWorkPanel({
   // "this is the PR"), then a link posted in THIS chat, then the remembered
   // auto pin, then branch discovery — discovery alone is ambiguous when
   // agents reuse a worktree across chats in one project.
-  const [pinned, setPinned] = React.useState<ChatPinnedPr | null>(() =>
-    readChatPinnedPr(chatId),
-  );
+  const [pinnedState, setPinnedState] = React.useState<PinnedPrState>(() => ({
+    chatId,
+    pinned: readChatPinnedPr(chatId),
+  }));
+  const pinned =
+    pinnedState.chatId === chatId
+      ? pinnedState.pinned
+      : readChatPinnedPr(chatId);
   React.useEffect(() => {
-    setPinned(readChatPinnedPr(chatId));
+    setPinnedState({ chatId, pinned: readChatPinnedPr(chatId) });
   }, [chatId]);
   // The empty-string sentinel means "user unlinked — no PR for this chat":
   // discovery stays off, posted links still win.
   const isUnpinned = pinned?.href === CHAT_PR_UNPINNED && pinned.manual;
+  const manualHref = pinned?.manual && pinned.href ? pinned.href : null;
+  const autoPinnedHref = !pinned?.manual && pinned?.href ? pinned.href : null;
   const discoveredPrQuery = useGithubPrForBranchQuery(
-    monitorActive && !prHref && pinned === null ? projectPath : null,
+    monitorActive && !prHref && !manualHref && !autoPinnedHref && !isUnpinned
+      ? projectPath
+      : null,
     branch,
   );
-  const manualHref = pinned?.manual && pinned.href ? pinned.href : null;
   const effectiveHref =
     manualHref ??
     prHref ??
-    (isUnpinned
-      ? null
-      : ((pinned?.href || null) ?? discoveredPrQuery.data ?? null));
+    autoPinnedHref ??
+    (isUnpinned ? null : (discoveredPrQuery.data ?? null));
   React.useEffect(() => {
-    // Remember what the chat resolved to — but never downgrade a manual pin.
+    // Remember PR links posted in this chat, but never persist branch
+    // discovery: discovery is useful as a live hint and too ambiguous to
+    // become durable chat ownership.
     const current = readChatPinnedPr(chatId);
     if (current?.manual) {
       return;
     }
-    if (effectiveHref && effectiveHref !== current?.href) {
-      writeChatPinnedPr(chatId, effectiveHref);
-      setPinned({ href: effectiveHref, manual: false });
+    if (prHref && prHref !== current?.href) {
+      writeChatPinnedPr(chatId, prHref);
+      updateChatWorkBinding(
+        chatId,
+        { prHref, prDetached: false },
+        { replacePr: false },
+      );
+      setPinnedState({ chatId, pinned: { href: prHref, manual: false } });
     }
-  }, [chatId, effectiveHref]);
+  }, [chatId, prHref]);
   const handleUnlinkPr = React.useCallback(() => {
     writeChatPinnedPr(chatId, CHAT_PR_UNPINNED, true);
-    setPinned({ href: CHAT_PR_UNPINNED, manual: true });
+    updateChatWorkBinding(
+      chatId,
+      { prHref: null, prDetached: true },
+      { replacePr: true },
+    );
+    setPinnedState({
+      chatId,
+      pinned: { href: CHAT_PR_UNPINNED, manual: true },
+    });
   }, [chatId]);
   const [isPinEditorOpen, setIsPinEditorOpen] = React.useState(false);
   const [pinInput, setPinInput] = React.useState("");
@@ -138,7 +170,12 @@ export function ChatWorkPanel({
       return;
     }
     writeChatPinnedPr(chatId, trimmed, true);
-    setPinned({ href: trimmed, manual: true });
+    updateChatWorkBinding(
+      chatId,
+      { prHref: trimmed, prDetached: false },
+      { replacePr: true },
+    );
+    setPinnedState({ chatId, pinned: { href: trimmed, manual: true } });
     setIsPinEditorOpen(false);
     setPinInput("");
   }, [chatId, pinInput]);
@@ -151,6 +188,24 @@ export function ChatWorkPanel({
   const ref = monitorActive ? parsedRef : null;
   const prQuery = useGithubPullRequestQuery(ref);
   const pr = prQuery.data ?? null;
+  React.useEffect(() => {
+    const pinnedHref = !pinned?.manual && pinned?.href ? pinned.href : null;
+    const normalizedBranch = branch?.trim();
+    const prHeadRef = pr?.headRef?.trim();
+    if (
+      !pinnedHref ||
+      effectiveHref !== pinnedHref ||
+      !normalizedBranch ||
+      !prHeadRef ||
+      prHeadRef === normalizedBranch
+    ) {
+      return;
+    }
+
+    clearChatPinnedPr(chatId);
+    clearChatWorkBindingPr(chatId, pinnedHref);
+    setPinnedState({ chatId, pinned: null });
+  }, [branch, chatId, effectiveHref, pinned, pr?.headRef]);
   const checksQuery = useGithubCheckSummaryQuery(ref, pr?.headSha);
   const checks = checksQuery.data ?? null;
   const commentStateQuery = useGithubCommentStateQuery(ref);

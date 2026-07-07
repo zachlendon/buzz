@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildProjectSetupContext,
+  deriveBranchTitle,
   deriveChatTitle,
   deriveConversationTitle,
   uniqueMentionPubkeys,
@@ -65,6 +66,22 @@ test("deriveConversationTitle strips markdown and URLs", () => {
 test("deriveConversationTitle falls back when nothing survives", () => {
   assert.equal(deriveConversationTitle("hey!"), "hey!");
   assert.equal(deriveConversationTitle("  "), "New chat");
+});
+
+test("deriveBranchTitle turns owner-prefixed branches into readable titles", () => {
+  assert.equal(deriveBranchTitle("kennylopez-welcome-icon"), "Welcome icon");
+  assert.equal(deriveBranchTitle("origin/kennylopez-chat-mode"), "Chat mode");
+  assert.equal(
+    deriveBranchTitle("refs/heads/kennethlopez-fix-activate-agent-banner"),
+    "Activate agent banner",
+  );
+});
+
+test("deriveBranchTitle strips common work prefixes and ticket keys", () => {
+  assert.equal(deriveBranchTitle("feat/spellcheck"), "Spellcheck");
+  assert.equal(deriveBranchTitle("fix/panel-width"), "Panel width");
+  assert.equal(deriveBranchTitle("ABC-123-copy-link-mode"), "Copy link mode");
+  assert.equal(deriveBranchTitle("wip"), null);
 });
 
 test("uniqueMentionPubkeys adds default agent and removes sender", () => {

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildChatLink,
+  buildDualOpenChatLink,
   isChatLink,
   parseChatLink,
   parseChatRouteLink,
@@ -27,6 +28,24 @@ test("buildChatLink omits blank titles", () => {
   assert.equal(
     buildChatLink({ chatId: CHAT, title: " " }),
     `buzz://chat?channel=${CHAT}`,
+  );
+});
+
+test("buildDualOpenChatLink uses a message link when a fallback message exists", () => {
+  assert.equal(
+    buildDualOpenChatLink({
+      chatId: CHAT,
+      fallbackMessageId: "event-123",
+      title: "Corner radius notes",
+    }),
+    `buzz://message?channel=${CHAT}&id=event-123&chat=1&title=Corner+radius+notes`,
+  );
+});
+
+test("buildDualOpenChatLink falls back to chat links without a message anchor", () => {
+  assert.equal(
+    buildDualOpenChatLink({ chatId: CHAT, title: "Corner radius notes" }),
+    `buzz://chat?channel=${CHAT}&title=Corner+radius+notes`,
   );
 });
 

@@ -12,7 +12,7 @@ import { toast } from "sonner";
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { ChannelCanvas } from "@/features/channels/ui/ChannelCanvas";
 import { useUpdateChatMetadataMutation } from "@/features/chats/hooks";
-import { buildChatLink } from "@/features/chats/lib/chatLink";
+import { buildDualOpenChatLink } from "@/features/chats/lib/chatLink";
 import {
   cleanAssistantMessageText,
   isHumanFacingAssistantText,
@@ -24,7 +24,10 @@ import type {
   ManagedAgent,
   RelayEvent,
 } from "@/shared/api/types";
-import { KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
+import {
+  CHANNEL_MESSAGE_EVENT_KINDS,
+  KIND_SYSTEM_MESSAGE,
+} from "@/shared/constants/kinds";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
@@ -292,13 +295,18 @@ function ChatShareMenu({
   metadata,
 }: ChatHeaderActionsProps) {
   const [isSharingSummary, setIsSharingSummary] = React.useState(false);
+  const fallbackMessageId = React.useMemo(
+    () => latestChatLinkAnchorMessageId(messages),
+    [messages],
+  );
   const chatLink = React.useMemo(
     () =>
-      buildChatLink({
+      buildDualOpenChatLink({
         chatId: chat.id,
+        fallbackMessageId,
         title: metadata?.title?.trim() || chat.name,
       }),
-    [chat.id, chat.name, metadata?.title],
+    [chat.id, chat.name, fallbackMessageId, metadata?.title],
   );
   const canShareSummary = Boolean(metadata?.sourceChannelId);
 
@@ -441,6 +449,21 @@ function summarizeChat(
         .join("\n");
 
   return truncateSummary(text);
+}
+
+function latestChatLinkAnchorMessageId(messages: RelayEvent[]) {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (
+      message?.id &&
+      CHANNEL_MESSAGE_EVENT_KINDS.includes(
+        message.kind as (typeof CHANNEL_MESSAGE_EVENT_KINDS)[number],
+      )
+    ) {
+      return message.id;
+    }
+  }
+  return null;
 }
 
 function eventHasTag(event: RelayEvent, name: string, value?: string) {
