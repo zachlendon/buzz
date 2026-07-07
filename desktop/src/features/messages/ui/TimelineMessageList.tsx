@@ -283,6 +283,13 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
           {group.items.map((item) => (
             <div
               className="timeline-row-cv"
+              data-agent-working={
+                item.kind === "message" &&
+                item.entry.summary != null &&
+                workingThreadHeadIds?.has(item.entry.message.id)
+                  ? "true"
+                  : undefined
+              }
               key={getTimelineItemKey(item)}
               style={timelineRowReserveStyle(item)}
             >

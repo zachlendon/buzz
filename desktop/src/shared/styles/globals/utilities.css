@@ -22,6 +22,15 @@
     content-visibility: visible;
   }
 
+  /* Rows with an animated working badge must stay painted: under
+     content-visibility: auto the browser may skip/throttle rendering work for
+     off-screen or contained rows, which makes the badge pulse stutter on
+     closed thread ingress rows (the open-thread panel has no containment and
+     animates smoothly). Scoped to the 1-2 rows with active agent work. */
+  .timeline-row-cv[data-agent-working="true"] {
+    content-visibility: visible;
+  }
+
   .content-visibility-auto-interactive {
     content-visibility: auto;
     contain-intrinsic-size: auto 200px;
