@@ -336,7 +336,7 @@ fn team_content(name: &str) -> TeamEventContent {
         name: name.to_string(),
         description: Some("remote desc".to_string()),
         persona_ids: vec!["p-remote-1".to_string(), "p-remote-2".to_string()],
-        agent_pubkeys: vec!["remote-agent-pk".to_string()],
+        agent_pubkeys: Some(vec!["remote-agent-pk".to_string()]),
     }
 }
 
@@ -368,6 +368,40 @@ fn inbound_team_match_patches_shared_preserves_local() {
     assert_eq!(t.symlink_target, Some("/external".to_string()));
     assert_eq!(t.version, Some("1.0".to_string()));
     assert_eq!(t.created_at, "2025-01-01T00:00:00Z");
+}
+
+#[test]
+fn inbound_team_none_agent_pubkeys_preserves_local_membership() {
+    // An event from a client that predates `agent_pubkeys` parses to `None`.
+    // The reconcile must NOT wipe local agent membership — the old client is
+    // ignorant of the field, not asserting emptiness.
+    let mut teams = vec![local_team()];
+    let mut content = team_content("Renamed By Old Client");
+    content.agent_pubkeys = None;
+    apply_inbound_team(&mut teams, TEAM_ID.to_string(), content);
+
+    let t = &teams[0];
+    assert_eq!(t.name, "Renamed By Old Client", "shared fields still apply");
+    assert_eq!(
+        t.agent_pubkeys,
+        vec!["local-agent-pk".to_string()],
+        "None must preserve local agent membership, not wipe it"
+    );
+}
+
+#[test]
+fn inbound_team_explicit_empty_agent_pubkeys_clears_local_membership() {
+    // `Some(vec![])` is a new client explicitly emptying the team — that DOES
+    // overwrite, unlike `None`.
+    let mut teams = vec![local_team()];
+    let mut content = team_content("Emptied Team");
+    content.agent_pubkeys = Some(vec![]);
+    apply_inbound_team(&mut teams, TEAM_ID.to_string(), content);
+
+    assert!(
+        teams[0].agent_pubkeys.is_empty(),
+        "explicit Some(vec![]) must clear local agent membership"
+    );
 }
 
 #[test]

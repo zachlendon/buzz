@@ -24,12 +24,21 @@ pub struct TeamEventContent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Pack persona members. Deliberately NOT `Option`-wrapped: this field
+    /// predates `agent_pubkeys`, so every shipped client understands it and
+    /// omits it only when the list is genuinely empty — omitted = empty.
+    /// Wrapping it would make an old client's legitimate empty-out parse as
+    /// `None` and freeze stale members on newer devices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub persona_ids: Vec<String>,
-    /// Managed-agent members by pubkey. Additive field — events published by
-    /// older clients simply omit it and parse to an empty list.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_pubkeys: Vec<String>,
+    /// Managed-agent members by pubkey. `Option` is PERMANENT wire semantics,
+    /// not a transitional shim: `None` = publisher predates this field (its
+    /// true membership is unknown — reconcile must preserve local), while
+    /// `Some(vec![])` = explicitly emptied. New clients always publish
+    /// `Some(...)`. "Cleaning up" the Option later reintroduces the bug where
+    /// an old client's event silently wipes team agent membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pubkeys: Option<Vec<String>>,
 }
 
 /// Project a `TeamRecord` onto the content fields published in team events.
@@ -40,7 +49,9 @@ pub fn team_event_content(record: &TeamRecord) -> TeamEventContent {
         name: record.name.clone(),
         description: record.description.clone(),
         persona_ids: record.persona_ids.clone(),
-        agent_pubkeys: record.agent_pubkeys.clone(),
+        // Always `Some`, even when empty — `None` is reserved for events from
+        // clients that predate the field (see the struct doc comment).
+        agent_pubkeys: Some(record.agent_pubkeys.clone()),
     }
 }
 
@@ -152,18 +163,33 @@ mod tests {
         assert!(json.contains("\"agent_pubkeys\""));
         let restored: TeamEventContent = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, event_content);
-        assert_eq!(restored.agent_pubkeys, vec!["a".repeat(64)]);
+        assert_eq!(restored.agent_pubkeys, Some(vec!["a".repeat(64)]));
     }
 
     #[test]
-    fn content_from_old_clients_without_agent_pubkeys_parses_empty() {
-        // agent_pubkeys is additive: events published before the field existed
-        // must still parse, with membership defaulting to no agent members.
+    fn content_from_old_clients_without_agent_pubkeys_parses_none() {
+        // Events published before `agent_pubkeys` existed must still parse.
+        // The field reads back `None` — NOT an empty list — so the reconcile
+        // can distinguish "publisher predates the field" from "explicitly
+        // emptied" and preserve local membership (see apply_inbound_team).
         let legacy = r#"{"name":"Old Team","persona_ids":["p1"]}"#;
         let restored: TeamEventContent = serde_json::from_str(legacy).unwrap();
         assert_eq!(restored.name, "Old Team");
         assert_eq!(restored.persona_ids, vec!["p1"]);
-        assert!(restored.agent_pubkeys.is_empty());
+        assert_eq!(restored.agent_pubkeys, None);
+    }
+
+    #[test]
+    fn content_publishes_some_even_when_agent_pubkeys_empty() {
+        // New clients must always publish `Some`, even for an empty list —
+        // `Some(vec![])` is the explicit "no agent members" signal that old
+        // clients can never produce.
+        let mut team = sample_team();
+        team.agent_pubkeys = vec![];
+        let event_content = team_event_content(&team);
+        assert_eq!(event_content.agent_pubkeys, Some(vec![]));
+        let json = serde_json::to_string(&event_content).unwrap();
+        assert!(json.contains("\"agent_pubkeys\":[]"));
     }
 
     #[test]

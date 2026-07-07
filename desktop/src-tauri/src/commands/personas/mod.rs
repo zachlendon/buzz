@@ -676,14 +676,22 @@ fn apply_inbound_team(teams: &mut Vec<TeamRecord>, d_tag: String, inbound: TeamE
             local.name = inbound.name;
             local.description = inbound.description;
             local.persona_ids = inbound.persona_ids;
-            local.agent_pubkeys = inbound.agent_pubkeys;
+            // `None` means the event came from a client that predates
+            // `agent_pubkeys` — its true membership is unknown, so preserve
+            // local. Only `Some` (including `Some(vec![])` = explicitly
+            // emptied) overwrites. See `TeamEventContent` for the wire rules.
+            if let Some(agent_pubkeys) = inbound.agent_pubkeys {
+                local.agent_pubkeys = agent_pubkeys;
+            }
         }
         None => teams.push(TeamRecord {
             id: d_tag,
             name: inbound.name,
             description: inbound.description,
             persona_ids: inbound.persona_ids,
-            agent_pubkeys: inbound.agent_pubkeys,
+            // Fresh insert has no local membership to preserve; `None` from a
+            // pre-field client simply means no known agent members.
+            agent_pubkeys: inbound.agent_pubkeys.unwrap_or_default(),
             is_builtin: false,
             source_dir: None,
             is_symlink: false,
