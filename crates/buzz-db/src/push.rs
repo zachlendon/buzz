@@ -15,6 +15,9 @@ use crate::error::Result;
 /// Maximum claims for a malformed matcher job before it is discarded.
 pub const MAX_MATCH_ATTEMPTS: i32 = 8;
 
+/// Maximum number of matcher rows removed in one disabled-mode transaction.
+pub const MATCH_DRAIN_BATCH: i64 = 1_000;
+
 /// Common signed-event ordering fields for a lease replacement.
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseVersion<'a> {
@@ -613,21 +616,55 @@ where
     .await?;
     let row = sqlx::query(
         r#"
-        WITH candidate AS (
-            SELECT community_id, event_id
-            FROM push_match_queue
-            WHERE attempts < $3
-              AND next_attempt_at <= now()
-              AND (state = 'pending' OR (state = 'matching' AND lease_until < now()))
-            ORDER BY next_attempt_at, created_at
-            FOR UPDATE SKIP LOCKED
+        WITH next_community AS MATERIALIZED (
+            SELECT state.community_id
+            FROM push_match_community_state state
+            WHERE state.queued_jobs > 0
+              AND EXISTS (
+                  SELECT 1
+                  FROM push_match_queue due
+                  WHERE due.community_id = state.community_id
+                    AND due.attempts < $3
+                    AND due.next_attempt_at <= now()
+                    AND (
+                        due.state = 'pending'
+                        OR (due.state = 'matching' AND due.lease_until < now())
+                    )
+              )
+            ORDER BY state.last_claimed_at, state.community_id
+            FOR UPDATE OF state SKIP LOCKED
             LIMIT 1
+        ), candidate AS MATERIALIZED (
+            SELECT queue.community_id, queue.event_id
+            FROM push_match_queue queue
+            JOIN next_community next
+              ON next.community_id = queue.community_id
+            WHERE queue.attempts < $3
+              AND queue.next_attempt_at <= now()
+              AND (
+                  queue.state = 'pending'
+                  OR (queue.state = 'matching' AND queue.lease_until < now())
+              )
+            ORDER BY queue.next_attempt_at, queue.created_at
+            FOR UPDATE OF queue SKIP LOCKED
+            LIMIT 1
+        ), claimed AS (
+            UPDATE push_match_queue queue
+            SET state='matching', claim_id=$1, lease_until=$2, attempts=attempts+1
+            FROM candidate
+            WHERE queue.community_id=candidate.community_id
+              AND queue.event_id=candidate.event_id
+            RETURNING queue.community_id, queue.event_id, queue.attempts
+        ), marked AS (
+            UPDATE push_match_community_state state
+            SET last_claimed_at=clock_timestamp()
+            FROM claimed
+            WHERE state.community_id=claimed.community_id
+            RETURNING state.community_id
         )
-        UPDATE push_match_queue q
-        SET state='matching', claim_id=$1, lease_until=$2, attempts=attempts+1
-        FROM candidate c
-        WHERE q.community_id=c.community_id AND q.event_id=c.event_id
-        RETURNING q.community_id, q.event_id, q.attempts
+        SELECT claimed.community_id, claimed.event_id, claimed.attempts
+        FROM claimed
+        JOIN marked USING (community_id)
         "#,
     )
     .bind(claim_id)
@@ -665,6 +702,50 @@ where
         claim_id,
         attempt,
     }))
+}
+
+/// Enable or disable trigger-side push matching for this deployment.
+///
+/// Lease admission and worker startup use the same configuration bit. Keeping
+/// the database trigger behind that bit prevents a disabled relay from building
+/// a queue that no process will consume.
+pub async fn set_match_runtime_enabled(pool: &PgPool, enabled: bool) -> Result<()> {
+    let result = sqlx::query("UPDATE push_match_runtime_state SET enabled=$1 WHERE singleton")
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(crate::DbError::InvalidData(
+            "push matcher runtime state is missing".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Remove a bounded batch of matcher jobs after push has been disabled.
+///
+/// The admission trigger has already stopped new rows, so repeated calls
+/// monotonically empty the backlog without one unbounded startup transaction.
+pub async fn discard_match_jobs(pool: &PgPool, limit: i64) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        WITH discarded AS (
+            SELECT community_id, event_id
+            FROM push_match_queue
+            ORDER BY created_at, community_id, event_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $1
+        )
+        DELETE FROM push_match_queue queue
+        USING discarded
+        WHERE queue.community_id=discarded.community_id
+          AND queue.event_id=discarded.event_id
+        "#,
+    )
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Load active endpoint-enabled leases for one tenant.
@@ -970,6 +1051,9 @@ mod tests {
         migration::run_migrations(&pool)
             .await
             .expect("run migrations");
+        set_match_runtime_enabled(&pool, true)
+            .await
+            .expect("enable matcher for push persistence tests");
         pool
     }
 
@@ -1468,6 +1552,7 @@ mod tests {
     async fn matcher_trigger_is_allowlisted_and_deleted_events_are_discarded() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
+        activate(&pool, community, &[31; 32], "matcher", &[32; 32], 1).await;
         let keys = nostr::Keys::generate();
         let push_event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "push")
             .sign_with_keys(&keys)
@@ -1516,9 +1601,96 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn matcher_admission_caps_one_community_without_rejecting_events() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        activate(&pool, community, &[37; 32], "matcher", &[38; 32], 1).await;
+        sqlx::query(
+            "INSERT INTO push_match_community_state (community_id, max_queued_jobs) \
+             VALUES ($1, 1) ON CONFLICT (community_id) DO UPDATE SET max_queued_jobs=1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("set a small matcher budget");
+
+        for content in ["first", "second"] {
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), content)
+                .sign_with_keys(&nostr::Keys::generate())
+                .expect("sign event");
+            let (_, inserted) = crate::event::insert_event(&pool, community, &event, None)
+                .await
+                .expect("accepted source event must not depend on push capacity");
+            assert!(inserted);
+        }
+
+        let queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM push_match_queue WHERE community_id=$1")
+                .bind(community.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("count bounded matcher jobs");
+        let state: (i64, i64) = sqlx::query_as(
+            "SELECT queued_jobs, dropped_jobs FROM push_match_community_state \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read matcher admission state");
+        assert_eq!(queued, 1);
+        assert_eq!(state, (1, 1));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn matcher_claim_rotates_between_communities() {
+        let pool = setup_pool().await;
+        let noisy = make_community(&pool).await;
+        let waiting = make_community(&pool).await;
+        activate(&pool, noisy, &[39; 32], "matcher", &[40; 32], 1).await;
+        activate(&pool, waiting, &[41; 32], "matcher", &[42; 32], 1).await;
+
+        for content in ["noisy-1", "noisy-2"] {
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), content)
+                .sign_with_keys(&nostr::Keys::generate())
+                .expect("sign noisy event");
+            crate::event::insert_event(&pool, noisy, &event, None)
+                .await
+                .expect("insert noisy event");
+        }
+        let waiting_event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "waiting")
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign waiting event");
+        crate::event::insert_event(&pool, waiting, &waiting_event, None)
+            .await
+            .expect("insert waiting event");
+
+        sqlx::query(
+            "UPDATE push_match_community_state SET last_claimed_at = CASE \
+             WHEN community_id=$1 THEN now() ELSE '-infinity'::timestamptz END \
+             WHERE community_id IN ($1, $2)",
+        )
+        .bind(noisy.as_uuid())
+        .bind(waiting.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("arrange fair-claim order");
+
+        let claimed = claim_due_match(&pool, Utc::now() + chrono::Duration::minutes(1))
+            .await
+            .expect("claim waiting tenant")
+            .expect("waiting tenant has a due job");
+        assert_eq!(claimed.community, waiting);
+        assert_eq!(claimed.event.event.id, waiting_event.id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn matcher_load_error_preserves_claimed_job_for_recovery() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
+        activate(&pool, community, &[33; 32], "matcher", &[34; 32], 1).await;
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "retry me")
             .sign_with_keys(&nostr::Keys::generate())
             .expect("sign event");
@@ -1558,6 +1730,7 @@ mod tests {
     async fn matcher_claim_is_exclusive_across_workers() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
+        activate(&pool, community, &[35; 32], "matcher", &[36; 32], 1).await;
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "one job")
             .sign_with_keys(&nostr::Keys::generate())
             .expect("sign event");
@@ -1624,14 +1797,14 @@ mod tests {
     async fn exhausted_match_job_is_reaped_and_cannot_pin_retention() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
+        let author = [25; 32];
+        activate(&pool, community, &author, "install", &[26; 32], 1).await;
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "poison")
             .sign_with_keys(&nostr::Keys::generate())
             .expect("sign event");
         crate::event::insert_event(&pool, community, &event, None)
             .await
             .expect("insert event");
-        let author = [25; 32];
-        activate(&pool, community, &author, "install", &[26; 32], 1).await;
         let wake_id = match enqueue_wake(
             &pool,
             community,

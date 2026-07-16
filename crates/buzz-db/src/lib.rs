@@ -1042,6 +1042,16 @@ impl Db {
         push::claim_due_match(&self.pool, lease_until).await
     }
 
+    /// Keep trigger-side matcher admission aligned with relay configuration.
+    pub async fn set_push_matching_enabled(&self, enabled: bool) -> Result<()> {
+        push::set_match_runtime_enabled(&self.pool, enabled).await
+    }
+
+    /// Remove one bounded batch of matcher jobs from a disabled deployment.
+    pub async fn discard_push_match_jobs(&self) -> Result<u64> {
+        push::discard_match_jobs(&self.pool, push::MATCH_DRAIN_BATCH).await
+    }
+
     /// Load active endpoint-enabled leases eligible for push matching.
     pub async fn active_push_match_leases(
         &self,

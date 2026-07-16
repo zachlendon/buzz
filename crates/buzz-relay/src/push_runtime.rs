@@ -8,7 +8,7 @@ use chrono::{TimeDelta, Utc};
 use nostr::{EventBuilder, Filter, Kind, Tag};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{handlers::push_lease::Subscription, state::AppState};
 
@@ -68,21 +68,36 @@ pub async fn run_matcher(state: Arc<AppState>) {
     }
 }
 
+/// Empty a pre-existing matcher backlog after push has been disabled.
+///
+/// Trigger-side admission is disabled before this task starts, so every
+/// successful batch moves the deployment toward an empty queue. Multiple pods
+/// can run the drainer safely because the database claim uses `SKIP LOCKED`.
+pub async fn drain_disabled_matcher(state: Arc<AppState>) {
+    loop {
+        match state.db.discard_push_match_jobs().await {
+            Ok(0) => {
+                info!("disabled push matcher backlog is empty");
+                return;
+            }
+            Ok(deleted) => {
+                info!(deleted, "discarded disabled push matcher jobs");
+                tokio::task::yield_now().await;
+            }
+            Err(e) => {
+                error!("disabled push matcher drain failed: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 async fn process_match(state: &AppState, job: &buzz_db::push::ClaimedMatch) -> anyhow::Result<()> {
     let leases = state.db.active_push_match_leases(job.community).await?;
     for lease in leases {
         let author_hex = hex::encode(&lease.author);
         if !reader_authorized_for_event(&job.event.event, &author_hex) {
             continue;
-        }
-        if let Some(channel) = job.event.channel_id {
-            if !state
-                .db
-                .is_member(job.community, channel, &lease.author)
-                .await?
-            {
-                continue;
-            }
         }
         let subscriptions: Vec<Subscription> = serde_json::from_value(lease.subscriptions.clone())?;
         let mut class: Option<&str> = None;
@@ -118,6 +133,18 @@ async fn process_match(state: &AppState, job: &buzz_db::push::ClaimedMatch) -> a
             }
         }
         let Some(class) = class else { continue };
+        // Most leases do not match a given event. Apply their pure filter and
+        // reader checks before spending a database round trip on channel
+        // membership; authorization is still required before enqueue.
+        if let Some(channel) = job.event.channel_id {
+            if !state
+                .db
+                .is_member(job.community, channel, &lease.author)
+                .await?
+            {
+                continue;
+            }
+        }
         let event_deadline = job.event.event.created_at.as_secs() as i64 + EVENT_USEFUL_SECS;
         let expires_at = lease.expires_at.min(event_deadline);
         if expires_at <= Utc::now().timestamp() {

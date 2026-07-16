@@ -162,6 +162,18 @@ async fn main() -> anyhow::Result<()> {
         info!("Skipping database migrations because BUZZ_AUTO_MIGRATE is not enabled");
     }
 
+    let push_matching_enabled = config.push_gateway_delivery_url.is_some();
+    db.set_push_matching_enabled(push_matching_enabled)
+        .await
+        .map_err(|e| {
+            error!("Failed to configure push matcher admission: {e}");
+            anyhow::anyhow!("Push matcher configuration failed: {e}")
+        })?;
+    info!(
+        enabled = push_matching_enabled,
+        "Push matcher database admission configured"
+    );
+
     if let Err(e) = db.ensure_future_partitions(3).await {
         error!("Failed to ensure partitions: {e}");
     }
@@ -638,6 +650,11 @@ async fn main() -> anyhow::Result<()> {
             &state,
         )));
         info!("NIP-PL push matcher and delivery worker started");
+    } else {
+        tokio::spawn(buzz_relay::push_runtime::drain_disabled_matcher(
+            Arc::clone(&state),
+        ));
+        info!("NIP-PL push disabled; draining any existing matcher backlog");
     }
 
     // NIP-ER reminder scheduler — polls for due reminders and publishes them

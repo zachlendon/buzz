@@ -549,7 +549,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 20);
+        assert_eq!(migrations.len(), 21);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -824,6 +824,16 @@ mod tests {
             .sql
             .as_str()
             .contains("join_policy_acceptances"));
+
+        // Push matching is explicitly enabled at runtime, admitted only while
+        // a community has an active lease, and bounded per community.
+        assert_eq!(migrations[20].version, 21);
+        let push_admission = migrations[20].sql.as_str();
+        assert!(push_admission.contains("CREATE TABLE push_match_runtime_state"));
+        assert!(push_admission.contains("CREATE TABLE push_match_community_state"));
+        assert!(push_admission.contains("queued_jobs < max_queued_jobs"));
+        assert!(push_admission.contains("FROM push_leases"));
+        assert!(push_admission.contains("WHERE singleton AND enabled"));
     }
 
     #[test]

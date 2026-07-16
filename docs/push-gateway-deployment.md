@@ -81,6 +81,14 @@ worker. Relays retain lease matching, authorization, coalescing, durable
 jobs/retries, and generation checks; they receive only opaque capabilities and
 never APNs tokens or provider credentials.
 
+Matcher admission is stored in PostgreSQL and set from this configuration at
+relay startup. Disabled relays stop trigger-side enqueue before draining any
+existing backlog in bounded batches. Enabled relays enqueue only for communities
+with an active endpoint lease, cap each community at 10,000 queued events, and
+rotate claims by the least recently served community. When a community reaches
+its queue limit, Buzz keeps the accepted event but skips its push match job; the
+per-community `dropped_jobs` counter records that degradation for operators.
+
 ## Relay integration status
 
 The operational relay integration is complete: per-origin event matching with
