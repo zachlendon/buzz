@@ -320,7 +320,7 @@ test("persona model options follow the selected LLM provider", async ({
   const provider = page.locator("#persona-runtime");
   const llmProvider = page.locator("#persona-llm-provider");
   const model = page.locator("#persona-model");
-  await expect(provider).toContainText("Buzz Agent (default)");
+  await expect(provider).toContainText("Goose (default)");
   await expect(llmProvider).toBeVisible();
   await expect(model).toBeVisible();
   // Without live discovery, the only static option is "Default model".
