@@ -269,6 +269,67 @@ async fn ensure_model_downloaded(model: &str) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("downloading {model} failed: {error}"))
 }
 
+/// Write Buzz's serve-side mesh-llm config and return its path.
+///
+/// Buzz normally lets mesh-llm synthesise an *isolated* throwaway config
+/// (see `prepare_isolated_config` in mesh-llm-host-runtime) that only disables
+/// the telemetry + blobstore plugins. Pointing the embedded serve node at an
+/// explicit `config_path` suppresses that helper, so this file must:
+///
+///   1. Re-assert the same no-leak plugin disables Buzz relies on.
+///   2. Pin reasoning **off by default**, so shared-compute consumers (goose,
+///      Buzz agents) don't burn hidden "thinking" tokens on every turn.
+///      Clients may still opt back in per request (`reasoning_effort`,
+///      `chat_template_kwargs.enable_thinking`, …).
+///
+/// This is a *separate* file from mesh-llm's global `config.toml`; Buzz never
+/// reads or writes the user's global mesh config. Re-written on every serve
+/// start so the reasoning-off default is always re-asserted.
+///
+/// NOTE (draft): the reasoning-off *default* is not yet runtime-verified on the
+/// embedded v0.73.1 runtime — see the PR description. Per-request silencing is
+/// proven; the config-surface default needs an e2e check.
+fn ensure_buzz_serve_config() -> anyhow::Result<std::path::PathBuf> {
+    use mesh_llm_host_runtime::crypto::default_keystore_path;
+
+    // Sibling of the owner keystore in the mesh data dir (~/.mesh-llm), but a
+    // distinct filename so we never touch the global config.toml.
+    let keystore = default_keystore_path()
+        .map_err(|error| anyhow::anyhow!("cannot resolve mesh data dir: {error}"))?;
+    let dir = keystore
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("mesh keystore path has no parent directory"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| anyhow::anyhow!("create mesh data dir {}: {error}", dir.display()))?;
+    let path = dir.join("buzz-serve-config.toml");
+
+    const CONTENTS: &str = "\
+# Managed by Buzz — regenerated on every shared-compute serve start.
+# Separate from mesh-llm's global config.toml; do not hand-edit.
+
+[[plugin]]
+name = \"telemetry\"
+enabled = false
+
+[[plugin]]
+name = \"blobstore\"
+enabled = false
+
+# Reasoning OFF by default so agent consumers don't burn hidden thinking
+# tokens. chat_template_kwargs.enable_thinking mirrors mesh-llm's own
+# apply_enable_thinking() knob; reasoning_enabled is the config-surface analogue.
+[defaults.request_defaults]
+reasoning_enabled = false
+
+[defaults.request_defaults.chat_template_kwargs]
+enable_thinking = false
+";
+
+    std::fs::write(&path, CONTENTS)
+        .map_err(|error| anyhow::anyhow!("write Buzz serve config {}: {error}", path.display()))?;
+    Ok(path)
+}
+
 impl DesktopMeshRuntime {
     pub async fn start(request: StartMeshNodeRequest) -> anyhow::Result<Self> {
         validate_no_leak_request(&request)?;
@@ -295,6 +356,11 @@ impl DesktopMeshRuntime {
                     .model(model)
                     .api_port(mesh_api_port()?)
                     .console_port(mesh_console_port()?)
+                    // Buzz-owned serve config: re-asserts the telemetry/blobstore
+                    // no-leak disables (which taking config_path suppresses in
+                    // mesh-llm's prepare_isolated_config) and pins reasoning off
+                    // by default so agent consumers don't burn thinking tokens.
+                    .config_path(ensure_buzz_serve_config()?)
                     // No-leak invariants: never publish mesh presence, never
                     // auto-discover other meshes, no public Nostr relays.
                     // Iroh relays are transport-only and enabled by default
