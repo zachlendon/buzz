@@ -10,6 +10,12 @@ use sha2::{Digest, Sha256};
 use crate::app_state::AppState;
 
 const DEFAULT_RELAY_WS_URL: &str = "ws://localhost:3000";
+const PROFILE_SYNC_MAX_ATTEMPTS: usize = 3;
+
+#[cfg(not(test))]
+const PROFILE_SYNC_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(test)]
+const PROFILE_SYNC_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
 // A reached-but-malformed 2xx body is NOT a connectivity failure, so this
 // message must never carry the "relay unreachable:" prefix the frontend
@@ -384,34 +390,60 @@ pub async fn sync_managed_agent_profile(
 ) -> Result<(), String> {
     // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
     let event = build_profile_event(agent_keys, display_name, avatar_url, auth_tag)?;
-    let event_json = event.as_json();
-    let body_bytes = event_json.into_bytes();
+    let body_bytes = event.as_json().into_bytes();
 
     let url = format!("{}/events", relay_http_base_url(relay_url));
-    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &url, &body_bytes)?;
+    let mut last_error = None;
 
-    let mut request = state
-        .http_client
-        .post(&url)
-        .header("Authorization", auth)
-        .header("Content-Type", "application/json");
-    if let Some(tag) = auth_tag {
-        request = request.header("x-auth-tag", tag);
+    // Profile publication is part of agent creation, but relay transport and
+    // projection errors can be transient. Retry the same signed replaceable
+    // event so onboarding does not leave a healthy local agent without its
+    // relay-backed name/avatar.
+    for attempt in 1..=PROFILE_SYNC_MAX_ATTEMPTS {
+        let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &url, &body_bytes)?;
+        let mut request = state
+            .http_client
+            .post(&url)
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json");
+        if let Some(tag) = auth_tag {
+            request = request.header("x-auth-tag", tag);
+        }
+
+        let result = async {
+            let response = request
+                .body(body_bytes.clone())
+                .send()
+                .await
+                .map_err(|e| classify_request_error(&e))?;
+
+            if !response.status().is_success() {
+                return Err(relay_error_message(response).await);
+            }
+
+            let result: SubmitEventResponse = parse_json_response(response).await?;
+            if !result.accepted {
+                return Err(format!("relay rejected event: {}", result.message));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt < PROFILE_SYNC_MAX_ATTEMPTS {
+            tokio::time::sleep(PROFILE_SYNC_RETRY_DELAY).await;
+        }
     }
-    let response = request
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| classify_request_error(&e))?;
 
-    if !response.status().is_success() {
-        let msg = relay_error_message(response).await;
-        return Err(format!(
-            "Created the agent, but could not sync its profile metadata: {msg}"
-        ));
-    }
-
-    Ok(())
+    Err(format!(
+        "Created the agent, but could not sync its profile metadata after {PROFILE_SYNC_MAX_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown relay error".to_string())
+    ))
 }
 
 // ── Agent profile query ─────────────────────────────────────────────────────
@@ -613,6 +645,10 @@ mod tests {
         build_profile_event, classify_intercepted_response, effective_agent_relay_url,
         parse_command_response, relay_http_base_url, MALFORMED_RESPONSE_MESSAGE,
     };
+    #[cfg(not(target_os = "windows"))]
+    use super::{sync_managed_agent_profile, PROFILE_SYNC_MAX_ATTEMPTS};
+    #[cfg(not(target_os = "windows"))]
+    use crate::app_state::build_app_state;
     use serde::Deserialize;
 
     // ── effective_agent_relay_url: per-agent override precedence ─────────────
@@ -896,5 +932,77 @@ mod tests {
             result.unwrap_err().contains("verification failed"),
             "error message should mention verification failure"
         );
+    }
+
+    // `build_app_state()` pulls native DLLs unavailable in the Windows CI
+    // runner. These stub-relay tests are hermetic (localhost axum) otherwise.
+    #[cfg(not(target_os = "windows"))]
+    async fn spawn_profile_stub(
+        accepted_after: Option<usize>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{routing::post, Router};
+        use std::sync::{atomic::Ordering, Arc};
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_attempts = attempts.clone();
+        let app = Router::new().route(
+            "/events",
+            post(move |body: String| {
+                let handler_attempts = handler_attempts.clone();
+                async move {
+                    let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    let accepted = accepted_after.is_some_and(|threshold| attempt >= threshold);
+                    let event: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or_default();
+                    axum::Json(serde_json::json!({
+                        "event_id": event.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                        "accepted": accepted,
+                        "message": if accepted { "" } else { "temporary projection failure" },
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind profile stub");
+        let addr = listener.local_addr().expect("profile stub addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), attempts)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn profile_sync_retries_rejected_2xx_response_until_accepted() {
+        use std::sync::atomic::Ordering;
+
+        let (relay_url, attempts) = spawn_profile_stub(Some(2)).await;
+        let state = build_app_state();
+        let keys = nostr::Keys::generate();
+
+        sync_managed_agent_profile(&state, &relay_url, &keys, "Honey", None, None)
+            .await
+            .expect("second relay response should be accepted");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn profile_sync_surfaces_rejected_2xx_response_after_retry_budget() {
+        use std::sync::atomic::Ordering;
+
+        let (relay_url, attempts) = spawn_profile_stub(None).await;
+        let state = build_app_state();
+        let keys = nostr::Keys::generate();
+
+        let error = sync_managed_agent_profile(&state, &relay_url, &keys, "Bumble", None, None)
+            .await
+            .expect_err("relay rejection must not be reported as success");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), PROFILE_SYNC_MAX_ATTEMPTS);
+        assert!(error.contains("after 3 attempts"));
+        assert!(error.contains("relay rejected event: temporary projection failure"));
     }
 }
