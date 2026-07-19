@@ -1181,7 +1181,9 @@ void main() {
           initialMessageId: 'target',
           initialThreadRootId: 'parent',
           threadReplies: {
-            'parent': [target],
+            // Relay subtree filtering is keyed by thread_metadata.root_event_id,
+            // so nested replies are returned by the outer-root query.
+            'root': [parent, target],
           },
           users: const {
             'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),

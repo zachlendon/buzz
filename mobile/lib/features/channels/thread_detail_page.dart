@@ -52,9 +52,13 @@ class ThreadDetailPage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    // Relay thread queries are keyed by the outermost root, even when this
+    // page displays a nested branch. Query that root, then select this head's
+    // direct children from the returned subtree below.
+    final queryRootId = threadHead.rootId ?? threadHead.id;
     final repliesState = ref.watch(
       threadRepliesProvider(
-        ThreadRepliesArgs(channelId: channelId, rootId: threadHead.id),
+        ThreadRepliesArgs(channelId: channelId, rootId: queryRootId),
       ),
     );
     final replyMessages = repliesState.whenData((events) {
@@ -64,7 +68,10 @@ class ThreadDetailPage extends HookConsumerWidget {
     final fetchedReplies = replyMessages.value;
     final allMsgs = fetchedReplies == null
         ? allMessages
-        : [threadHead, ...fetchedReplies];
+        : [
+            threadHead,
+            ...fetchedReplies.where((message) => message.id != threadHead.id),
+          ];
 
     // Index all messages by parentId so we can find direct children of any
     // message and compute thread summaries for nested threads.
