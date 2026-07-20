@@ -19,7 +19,7 @@ import {
   parseEmojiAvatarDataUrl,
   ProfileAvatarEditor,
 } from "@/features/profile/ui/ProfileAvatarEditor";
-import { updateProfile } from "@/shared/api/tauriProfiles";
+import { getProfile, updateProfile } from "@/shared/api/tauriProfiles";
 import { getIdentity, importIdentity } from "@/shared/api/tauriIdentity";
 import { listPersonas } from "@/shared/api/tauriPersonas";
 import { relayClient } from "@/shared/api/relayClient";
@@ -151,6 +151,7 @@ export function CommunityOnboardingFlow({
     [],
   );
   const [isPending, setIsPending] = React.useState(false);
+  const checkedProfileTransactionRef = React.useRef<string | null>(null);
   const [starterChannelFailureCount, setStarterChannelFailureCount] =
     React.useState(0);
   const [deniedPubkey, setDeniedPubkey] = React.useState("");
@@ -274,6 +275,22 @@ export function CommunityOnboardingFlow({
   }, [isPending, update]);
 
   const isProfileStage = transaction?.stage === "profile";
+  React.useEffect(() => {
+    if (!isProfileStage || !transaction) return;
+    if (checkedProfileTransactionRef.current === transaction.id) return;
+
+    checkedProfileTransactionRef.current = transaction.id;
+    void getProfile()
+      .then((profile) => {
+        if (profile.hasProfileEvent) {
+          update({ stage: "team-intro", error: undefined }, transaction.id);
+        }
+      })
+      .catch(() => {
+        // Discovery is best-effort. Staying on the profile step preserves the
+        // existing path when the relay cannot answer the lookup.
+      });
+  }, [isProfileStage, transaction, update]);
   const isTeamStage =
     transaction?.stage === "team-intro" ||
     transaction?.stage === "finalizing" ||
