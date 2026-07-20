@@ -68,7 +68,10 @@ pub struct Config {
     pub max_concurrent_handlers: usize,
     /// Maximum plain event inserts coalesced into one group-commit
     /// transaction (`BUZZ_WRITE_BATCH_MAX`). `0` disables batching and every
-    /// insert commits individually (the pre-batching behavior).
+    /// insert commits individually (the pre-batching behavior). Defaults to
+    /// `0`: benchmarks on the repaired-T1a base showed the single batch lane
+    /// cuts DB commits/msg ~25% but regresses p50/p99 latency at 500-1000 QPS,
+    /// so batching is opt-in until that trade-off is resolved.
     pub write_batch_max: usize,
     /// Per-connection outbound message buffer size (number of messages).
     pub send_buffer_size: usize,
@@ -433,10 +436,13 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024);
 
+        // Default off (`0`): group-commit batching measurably regressed
+        // p50/p99 latency at 500-1000 QPS on the repaired-T1a base despite
+        // saving ~25% of DB commits. Opt in explicitly per deployment.
         let write_batch_max = std::env::var("BUZZ_WRITE_BATCH_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(buzz_db::batch::DEFAULT_MAX_BATCH);
+            .unwrap_or(0);
 
         let send_buffer_size = std::env::var("BUZZ_SEND_BUFFER")
             .ok()

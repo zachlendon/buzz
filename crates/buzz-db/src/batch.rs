@@ -55,7 +55,9 @@ use crate::error::{DbError, Result};
 use crate::event::ThreadMetadataParams;
 use crate::Db;
 
-/// Default maximum events coalesced into one transaction.
+/// Suggested maximum events coalesced into one transaction when batching is
+/// enabled. Not the relay default — `BUZZ_WRITE_BATCH_MAX` defaults to `0`
+/// (batching off); see `Config::from_env` in `buzz-relay`.
 pub const DEFAULT_MAX_BATCH: usize = 16;
 
 /// Queue depth for pending insert requests (matches the relay's default
