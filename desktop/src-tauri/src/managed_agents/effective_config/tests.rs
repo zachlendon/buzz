@@ -520,3 +520,48 @@ fn orphaned_instance_never_triggers_mesh_preflight() {
 
     assert_eq!(resolve_effective_relay_mesh_model_id(&rec, &[], &g), None);
 }
+
+// ── Whitespace-provider parity (trim-mismatch regression, T1) ──
+//
+// The old spawn gate was `effective_provider.as_deref() == Some(RELAY_MESH_PROVIDER_ID)`
+// — an exact compare — while `relay_mesh_model_id()` trims before matching.
+// A stored provider of " relay-mesh " would make preflight fire while spawn
+// skipped the mesh-env block.  After the fix spawn derives its gate from
+// `relay_mesh_model_id()` too, so the trim semantics are identical.
+//
+// These tests verify `relay_mesh_model_id()` returns Some for padded providers
+// on every resolution path, confirming the helper that both callers now use
+// handles whitespace correctly.
+
+/// Definition provider with leading/trailing whitespace — resolver preserves
+/// the raw string, but `relay_mesh_model_id()` trims before matching, so the
+/// mesh preflight fires correctly.
+#[test]
+fn whitespace_provider_in_definition_triggers_mesh_decision() {
+    let rec = record(Some("d1"), None, None, None);
+    let defs = vec![definition("d1", Some("qwen3"), Some(" relay-mesh "), "")];
+    let g = global(None, None);
+
+    let mesh_id = resolve_effective_relay_mesh_model_id(&rec, &defs, &g);
+    assert_eq!(
+        mesh_id.as_deref(),
+        Some("qwen3"),
+        "padded definition provider must be treated as relay-mesh by the shared helper"
+    );
+}
+
+/// Global provider with leading/trailing whitespace — same assertion for the
+/// global-inherit path (blank definition falls through to padded global).
+#[test]
+fn whitespace_provider_in_global_triggers_mesh_decision() {
+    let rec = record(Some("d1"), None, None, None);
+    let defs = vec![definition("d1", None, None, "")];
+    let g = global(Some("qwen3"), Some("\trelay-mesh\t"));
+
+    let mesh_id = resolve_effective_relay_mesh_model_id(&rec, &defs, &g);
+    assert_eq!(
+        mesh_id.as_deref(),
+        Some("qwen3"),
+        "padded global provider must be treated as relay-mesh by the shared helper"
+    );
+}

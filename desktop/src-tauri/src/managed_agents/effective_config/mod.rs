@@ -29,10 +29,14 @@ impl EffectiveAgentConfig {
     /// The relay-mesh model id this config resolves to, or `None` when the
     /// effective provider isn't relay-mesh.
     ///
-    /// Derived from the SAME `model`/`provider` this struct already carries —
-    /// the identical resolution spawn's `apply_relay_mesh_env` consults — so a
-    /// mesh preflight built from this can never disagree with what spawn does.
-    /// Mirrors `apply_relay_mesh_env`'s own blank-model-defaults-to-"auto" rule.
+    /// This is the single authoritative mesh decision for this config.  Both
+    /// the mesh preflight (interactive start, restore-on-launch) AND spawn's
+    /// `apply_relay_mesh_env` block MUST derive their mesh gate from this
+    /// method — never from a separate provider comparison — so the two paths
+    /// are guaranteed to agree even when the stored provider string has leading
+    /// or trailing whitespace.  The provider is trimmed before matching;
+    /// a blank effective model falls back to "auto", mirroring
+    /// `apply_relay_mesh_env`'s own rule.
     pub fn relay_mesh_model_id(&self) -> Option<String> {
         if self.provider.value.as_deref().map(str::trim) != Some(RELAY_MESH_PROVIDER_ID) {
             return None;

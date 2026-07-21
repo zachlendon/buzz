@@ -1793,6 +1793,13 @@ pub fn spawn_agent_child(
     // performs below, so env write and restart badge cannot disagree. Linked
     // instances never consult the record's own model/provider/prompt bytes;
     // definition-less instances fall back to their own fields, then global.
+    //
+    // Derive the mesh decision BEFORE moving fields out — `relay_mesh_model_id`
+    // is the single authoritative gate; the mesh-llm block below MUST use it
+    // rather than re-deriving from `effective_provider` to keep preflight and
+    // spawn semantics in lock-step (see `EffectiveAgentConfig::relay_mesh_model_id`).
+    #[cfg(feature = "mesh-llm")]
+    let mesh_model_id = effective_cfg.relay_mesh_model_id();
     let effective_prompt = effective_cfg.system_prompt.value;
     let effective_model = effective_cfg.model.value;
     let effective_provider = effective_cfg.provider.value;
@@ -1904,13 +1911,16 @@ pub fn spawn_agent_child(
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
     // transport at spawn time and scrub any unrelated ambient OpenAI key.
+    // Gate on `mesh_model_id` (derived from `effective_cfg.relay_mesh_model_id()`
+    // above) — not on `effective_provider` directly — so the mesh gate here
+    // uses the same trim semantics as the preflight callers.
     #[cfg(feature = "mesh-llm")]
-    if effective_provider.as_deref() == Some(super::RELAY_MESH_PROVIDER_ID) {
+    if let Some(ref mesh_model_id) = mesh_model_id {
         let mut mesh_env = std::collections::BTreeMap::new();
         super::apply_relay_mesh_env(
             &mut mesh_env,
-            effective_provider.as_deref(),
-            effective_model.as_deref(),
+            Some(super::RELAY_MESH_PROVIDER_ID),
+            Some(mesh_model_id.as_str()),
         );
         command.env_remove("OPENAI_API_KEY");
         for (key, value) in mesh_env {
