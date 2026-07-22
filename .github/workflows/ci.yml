@@ -61,6 +61,8 @@ jobs:
               - '.github/workflows/ci.yml'
       - name: Release workflow source contract
         run: scripts/test-release-ref-contract.sh
+      - name: Relay image publication contract
+        run: scripts/test-relay-image-publication-contract.sh
 
   rust-lint:
     name: Rust Lint

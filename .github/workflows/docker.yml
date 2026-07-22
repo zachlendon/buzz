@@ -1,6 +1,7 @@
 name: Docker image
 
-# Builds and publishes the public Buzz relay image as ghcr.io/block/buzz.
+# Builds and publishes this fork's public Buzz relay image as
+# ghcr.io/zachlendon/buzz.
 #
 # Strategy: each architecture builds on its native runner (ubuntu-24.04 for
 # amd64, ubuntu-24.04-arm for arm64), pushes to GHCR by digest, then a final
@@ -69,10 +70,10 @@ concurrency:
 permissions: {}
 
 env:
-  # Single source of truth for the image name. Set GHCR_IMAGE as a repo
-  # variable to override (e.g., for forks that want to push to their own
-  # namespace without forking this file).
-  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/block/buzz' }}
+  # Single source of truth for the relay image name. This fork defaults to its
+  # own package; set GHCR_IMAGE as a repo variable only for an intentional
+  # alternate publication target.
+  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/zachlendon/buzz' }}
 
 jobs:
   build:
@@ -274,7 +275,7 @@ jobs:
 
       - name: Attest provenance for the merged image
         # Sigstore-signed in-toto attestation, verifiable with:
-        #   gh attestation verify oci://ghcr.io/block/buzz:<tag> --owner block
+        #   gh attestation verify oci://ghcr.io/zachlendon/buzz:<tag> --owner zachlendon
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-name: ${{ env.IMAGE_NAME }}
@@ -299,7 +300,7 @@ jobs:
             echo
             echo "Verify provenance:"
             echo '```'
-            echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner block"
+            echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner ${GITHUB_REPOSITORY_OWNER}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
