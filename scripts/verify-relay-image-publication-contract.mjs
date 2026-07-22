@@ -25,6 +25,40 @@ const GATEWAY_BUILD_PERMISSIONS = {
   contents: "read",
   packages: "write",
 };
+const DOCKER_EVENTS = ["push", "pull_request", "workflow_dispatch"];
+const DOCKER_JOBS = [
+  "build",
+  "merge",
+  "push-gateway-build",
+  "push-gateway-merge",
+];
+const PULL_REQUEST_PATHS = [
+  "Dockerfile",
+  "Dockerfile.push-gateway",
+  ".dockerignore",
+  ".github/workflows/docker.yml",
+  "Cargo.toml",
+  "Cargo.lock",
+  "rust-toolchain.toml",
+  "crates/**",
+  "web/**",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "patches/**",
+];
+const METADATA_TAGS = `type=ref,event=branch,enable=\${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
+type=sha,prefix=sha-,format=short,enable=\${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
+type=semver,pattern={{version}},match=^relay-v(.*)$,value=\${{ inputs.version }}
+type=semver,pattern={{major}}.{{minor}},match=^relay-v(.*)$,value=\${{ inputs.version }}
+type=semver,pattern={{major}},match=^relay-v(.*)$,value=\${{ inputs.version }}
+`;
+const METADATA_LABELS = `org.opencontainers.image.title=Buzz
+org.opencontainers.image.description=WebSocket relay server for the Buzz communications platform
+org.opencontainers.image.licenses=Apache-2.0
+`;
+const CACHE_TO =
+  "${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}\n";
 
 const BUILD_STEP_NAMES = [
   "Checkout",
@@ -154,6 +188,17 @@ function findStep(job, name) {
   return matches[0];
 }
 
+function validateImmutableActionPins(steps, label) {
+  for (const step of steps) {
+    if (typeof step.uses !== "string" || step.uses.startsWith("./")) continue;
+    assert.match(
+      step.uses,
+      /^[^@\s]+@[0-9a-f]{40}$/,
+      `${label}:${step.name ?? step.uses} must use a full immutable SHA`,
+    );
+  }
+}
+
 function validateConditions(build, merge) {
   assert.equal(own(build, "if"), false, "relay build job must not have an if");
   assert.equal(
@@ -213,15 +258,20 @@ function validateDigestDataflow(build, merge) {
     buildPush.uses,
     "docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf",
   );
-  assert.equal(
-    buildPush.with.outputs,
-    "type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}",
-    "relay build output must bind IMAGE_NAME and publish by digest",
-  );
-  assert.equal(
-    buildPush.with["cache-from"],
-    "type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}\n",
-    "relay build cache source must derive from IMAGE_NAME",
+  assert.deepEqual(
+    buildPush.with,
+    {
+      context: ".",
+      file: "./Dockerfile",
+      platforms: "${{ matrix.platform }}",
+      labels: "${{ steps.meta.outputs.labels }}",
+      outputs:
+        "type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}",
+      "cache-from":
+        "type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}\n",
+      "cache-to": CACHE_TO,
+    },
+    "relay build inputs must bind the sole image and cache target to IMAGE_NAME",
   );
 
   const exportDigest = findStep(build, "Export digest");
@@ -388,14 +438,47 @@ function validateDockerWorkflow(source) {
     "workflow permissions must default to none",
   );
   assert.deepEqual(
+    Object.keys(workflow.on).sort(),
+    [...DOCKER_EVENTS].sort(),
+    "Docker events must be exactly push, pull_request, and workflow_dispatch",
+  );
+  assert.deepEqual(
     workflow.on.push.branches,
     ["main"],
     "Docker push branches must be exactly main",
+  );
+  assert.deepEqual(
+    workflow.on.push.tags,
+    ["relay-v[0-9]*"],
+    "Docker push tags must be exactly relay-v[0-9]*",
   );
   exactKeys(
     workflow.on.push,
     ["branches", "tags"],
     "Docker push trigger must not define paths, paths-ignore, or extra filters",
+  );
+  assert.deepEqual(
+    workflow.on.pull_request,
+    { paths: PULL_REQUEST_PATHS },
+    "Docker pull_request trigger changed",
+  );
+  assert.deepEqual(
+    workflow.on.workflow_dispatch,
+    {
+      inputs: {
+        version: {
+          description:
+            "Semver version e.g. 0.3.0 (no relay-v prefix) — for relay-tag rescue dispatch",
+          required: true,
+        },
+      },
+    },
+    "Docker workflow_dispatch trigger changed",
+  );
+  assert.deepEqual(
+    Object.keys(workflow.jobs).sort(),
+    [...DOCKER_JOBS].sort(),
+    "Docker jobs must be exactly the relay and guarded push-gateway jobs",
   );
 
   const imageDefinitions = [];
@@ -450,10 +533,27 @@ function validateDockerWorkflow(source) {
   validateLogin(build, "build");
   validateLogin(merge, "merge");
 
-  for (const job of [build, merge]) {
+  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    validateImmutableActionPins(job.steps, `${WORKFLOW}:${jobName}`);
+  }
+
+  for (const [jobName, job] of [
+    ["build", build],
+    ["merge", merge],
+  ]) {
     const metadata = findStep(job, "Extract metadata");
     assert.equal(metadata.id, "meta", "relay metadata step id changed");
-    assert.equal(metadata.with.images, "${{ env.IMAGE_NAME }}");
+    assert.deepEqual(
+      metadata.with,
+      jobName === "build"
+        ? {
+            images: "${{ env.IMAGE_NAME }}",
+            tags: METADATA_TAGS,
+            labels: METADATA_LABELS,
+          }
+        : { images: "${{ env.IMAGE_NAME }}", tags: METADATA_TAGS },
+      `relay ${jobName} metadata inputs changed`,
+    );
   }
 
   validateDigestDataflow(build, merge);
@@ -651,11 +751,33 @@ export function verifyRepository(root, overrides = new Map()) {
     ".github/workflows/ci.yml",
   ).value;
   const ciSteps = ci.jobs.changes.steps;
+  assert.deepEqual(
+    ci.jobs.changes.permissions,
+    { contents: "read", "pull-requests": "read" },
+    "CI changes job permissions changed",
+  );
+  validateImmutableActionPins(ciSteps, ".github/workflows/ci.yml:changes");
+  const activationIndex = ciSteps.findIndex(
+    (step) =>
+      step.uses ===
+      "cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616",
+  );
+  assert.notEqual(
+    activationIndex,
+    -1,
+    "CI changes job must activate Hermit at the approved immutable SHA",
+  );
   const contractStep = ciSteps.filter(
     (step) => step.name === "Relay image publication contract",
   );
   assert.equal(contractStep.length, 1, "CI must have one relay contract step");
+  exactKeys(contractStep[0], ["name", "run"], "CI contract step changed");
   assert.equal(contractStep[0].run, "pnpm test:relay-image-contract");
+  assert.deepEqual(
+    ciSteps.filter((step) => step.run === "pnpm test:relay-image-contract"),
+    contractStep,
+    "CI must invoke the relay contract exactly once",
+  );
   const installStep = ciSteps.filter(
     (step) => step.name === "Install relay contract dependencies",
   );
@@ -664,9 +786,16 @@ export function verifyRepository(root, overrides = new Map()) {
     1,
     "CI must install relay contract dependencies",
   );
+  exactKeys(installStep[0], ["name", "run"], "CI install step changed");
   assert.equal(
     installStep[0].run,
     "pnpm install --frozen-lockfile --filter buzz-workspace",
+  );
+  const installIndex = ciSteps.indexOf(installStep[0]);
+  const contractIndex = ciSteps.indexOf(contractStep[0]);
+  assert.ok(
+    activationIndex < installIndex && installIndex < contractIndex,
+    "CI must activate Hermit, install dependencies, then invoke the contract",
   );
 
   const packageManifest = JSON.parse(readFile(root, "package.json", overrides));
