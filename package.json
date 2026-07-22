@@ -3,10 +3,12 @@
   "private": true,
   "packageManager": "pnpm@11.4.0",
   "scripts": {
-    "check": "pnpm -r check"
+    "check": "pnpm -r check",
+    "test:relay-image-contract": "scripts/test-relay-image-publication-contract.sh"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.6"
+    "@biomejs/biome": "^2.4.6",
+    "yaml": "2.9.0"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19"
