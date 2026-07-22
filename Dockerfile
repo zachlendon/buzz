@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
-# Public Buzz relay image — published as ghcr.io/block/buzz:<tag>.
+# Public Buzz relay image for this fork — published as
+# ghcr.io/zachlendon/buzz:<tag> by default.
 #
 # Builds the `buzz-relay` binary (Rust 1.95) and the `buzz-web` static bundle
 # (pnpm + vite), then assembles them into a small debian-slim runtime with
@@ -119,9 +120,9 @@ FROM debian:${DEBIAN_VERSION}-slim AS runtime
 # one — without it GHCR keeps the image private even when the repo is public.
 LABEL org.opencontainers.image.title="Buzz" \
       org.opencontainers.image.description="WebSocket relay server for the Buzz communications platform" \
-      org.opencontainers.image.source="https://github.com/block/buzz" \
-      org.opencontainers.image.url="https://github.com/block/buzz" \
-      org.opencontainers.image.documentation="https://github.com/block/buzz#readme" \
+      org.opencontainers.image.source="https://github.com/zachlendon/buzz" \
+      org.opencontainers.image.url="https://github.com/zachlendon/buzz" \
+      org.opencontainers.image.documentation="https://github.com/zachlendon/buzz#readme" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \

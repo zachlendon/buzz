@@ -23,7 +23,7 @@ quickstart: false
 
 # ── Image ────────────────────────────────────────────────────────────────────
 image:
-  repository: ghcr.io/block/buzz
+  repository: ghcr.io/zachlendon/buzz
   tag: ""                        # empty → .Chart.AppVersion
   pullPolicy: IfNotPresent
   pullSecrets: []
