@@ -1181,7 +1181,13 @@ impl Config {
 
         let agent_args = normalize_agent_args(&agent_command, args.agent_args);
 
-        if personal_delegate_mode {
+        // Personal Delegate stream-message-only boundary. Under
+        // SubscribeMode::All, `kinds_override: None` is a NIP-01 kinds
+        // wildcard; owner-authored UI/presence/typing/read/control events
+        // would otherwise start a second prompt with a different event ID.
+        // Fail closed: default missing kinds to exactly [9]; reject any
+        // explicit set other than exactly [KIND_STREAM_MESSAGE].
+        let kinds_override = if personal_delegate_mode {
             if normalize_agent_command_identity(&agent_command) != "buzz-agent" {
                 return Err(ConfigError::ConfigFile(
                     "Personal Delegate mode requires the native buzz-agent runtime".into(),
@@ -1202,7 +1208,20 @@ impl Config {
                     "Personal Delegate mode requires exactly one agent".into(),
                 ));
             }
-        }
+            use buzz_core::kind::KIND_STREAM_MESSAGE;
+            match args.kinds.as_deref() {
+                None => Some(vec![KIND_STREAM_MESSAGE]),
+                Some([kind]) if *kind == KIND_STREAM_MESSAGE => Some(vec![KIND_STREAM_MESSAGE]),
+                Some(kinds) => {
+                    return Err(ConfigError::ConfigFile(format!(
+                        "Personal Delegate mode requires --kinds exactly [{KIND_STREAM_MESSAGE}] \
+                         (stream messages only); got {kinds:?}"
+                    )));
+                }
+            }
+        } else {
+            args.kinds
+        };
 
         if let Some(ref channels) = args.channels {
             for ch in channels {
@@ -1398,7 +1417,7 @@ impl Config {
             dedup_mode: args.dedup,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
-            kinds_override: args.kinds,
+            kinds_override,
             channels_override: args.channels,
             no_mention_filter: args.no_mention_filter,
             config_path: args.config,
@@ -2327,6 +2346,200 @@ mod tests {
         assert!(!ordinary.personal_delegate_mode);
         assert_eq!(ordinary.agent_args, vec!["acp".to_string()]);
         assert_eq!(ordinary.persona_env_vars, Vec::<(String, String)>::new());
+    }
+
+    /// Personal Delegate with no `--kinds` must resolve to exactly stream
+    /// messages (kind 9), never a NIP-01 kinds wildcard.
+    #[cfg(unix)]
+    #[test]
+    fn personal_delegate_mode_defaults_kinds_to_stream_message_only() {
+        use buzz_core::kind::KIND_STREAM_MESSAGE;
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        const TEST_PROVIDER_KEY: &str = "test-ollama-cloud-key-sentinel-kinds-default";
+        let provider_fd = pipe_with_secret(format!("{TEST_PROVIDER_KEY}\n").as_bytes());
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+            "--subscribe",
+            "all",
+        ])
+        .unwrap();
+
+        let config = Config::from_args(args).unwrap();
+        assert!(config.personal_delegate_mode);
+        assert_eq!(
+            config.kinds_override.as_deref(),
+            Some([KIND_STREAM_MESSAGE].as_slice()),
+            "missing --kinds must default to exactly [9]"
+        );
+    }
+
+    /// Explicit `--kinds 9` is the only accepted Personal Delegate kinds set.
+    #[cfg(unix)]
+    #[test]
+    fn personal_delegate_mode_accepts_explicit_stream_message_kind() {
+        use buzz_core::kind::KIND_STREAM_MESSAGE;
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        const TEST_PROVIDER_KEY: &str = "test-ollama-cloud-key-sentinel-kinds-explicit";
+        let provider_fd = pipe_with_secret(format!("{TEST_PROVIDER_KEY}\n").as_bytes());
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+            "--subscribe",
+            "all",
+            "--kinds",
+            "9",
+        ])
+        .unwrap();
+
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.kinds_override.as_deref(),
+            Some([KIND_STREAM_MESSAGE].as_slice())
+        );
+    }
+
+    /// Non-9 and mixed kinds sets are rejected before any prompt can start.
+    #[test]
+    fn personal_delegate_mode_rejects_non_stream_message_kinds() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+
+        for kinds in ["7", "9,7", "1", "20001", "9,20002"] {
+            let args = CliArgs::try_parse_from([
+                "buzz-acp",
+                "--private-key",
+                nsec.as_str(),
+                "--agent-command",
+                "/opt/pinned/buzz-agent",
+                "--personal-delegate-mcp-config",
+                "/opt/personal-delegate/config.json",
+                "--personal-delegate-mcp-command",
+                "/opt/personal-delegate/personal-delegate-mcp",
+                "--provider-key-fd",
+                "4",
+                "--kinds",
+                kinds,
+            ])
+            .unwrap();
+            let error = Config::from_args(args).unwrap_err().to_string();
+            assert!(
+                error.contains("requires --kinds exactly [9]"),
+                "kinds={kinds} must be rejected: {error}"
+            );
+        }
+    }
+
+    /// Ordinary (non-Personal-Delegate) SubscribeMode::All still wildcards
+    /// when no --kinds is supplied.
+    #[test]
+    fn ordinary_all_mode_without_kinds_remains_wildcard() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "goose",
+            "--subscribe",
+            "all",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.personal_delegate_mode);
+        assert!(config.kinds_override.is_none());
+        let ch = Uuid::new_v4();
+        let filters = resolve_channel_filters(&config, &[ch], &[]);
+        assert!(
+            filters.get(&ch).unwrap().kinds.is_none(),
+            "ordinary All mode must keep kinds wildcard"
+        );
+    }
+
+    /// Resolved Personal Delegate channel filter is never a kinds wildcard and
+    /// admits only kind:9 — not owner-authored reaction/presence/typing/read.
+    #[cfg(unix)]
+    #[test]
+    fn personal_delegate_resolved_channel_filter_is_stream_message_only() {
+        use buzz_core::kind::{
+            KIND_PRESENCE_UPDATE, KIND_REACTION, KIND_READ_STATE, KIND_STREAM_MESSAGE,
+            KIND_TYPING_INDICATOR,
+        };
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        const TEST_PROVIDER_KEY: &str = "test-ollama-cloud-key-sentinel-kinds-filter";
+        let provider_fd = pipe_with_secret(format!("{TEST_PROVIDER_KEY}\n").as_bytes());
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+            "--subscribe",
+            "all",
+            // No --kinds: config must still fail closed to [9].
+        ])
+        .unwrap();
+
+        let config = Config::from_args(args).unwrap();
+        let ch = Uuid::new_v4();
+        let filters = resolve_channel_filters(&config, &[ch], &[]);
+        let filter = filters.get(&ch).expect("channel filter present");
+        let kinds = filter
+            .kinds
+            .as_ref()
+            .expect("Personal Delegate channel filter must not be a kinds wildcard");
+        assert_eq!(kinds.as_slice(), [KIND_STREAM_MESSAGE]);
+        assert!(kinds.contains(&KIND_STREAM_MESSAGE));
+        assert!(!kinds.contains(&KIND_REACTION)); // 7
+        assert!(!kinds.contains(&KIND_PRESENCE_UPDATE)); // 20001
+        assert!(!kinds.contains(&KIND_TYPING_INDICATOR)); // 20002
+        assert!(!kinds.contains(&KIND_READ_STATE)); // 30078
+
+        // Dynamic discovery path must apply the same non-wildcard boundary.
+        let dynamic = resolve_dynamic_channel_filter(&config, ch, &[])
+            .expect("dynamic filter for in-scope channel");
+        let dynamic_kinds = dynamic
+            .kinds
+            .as_ref()
+            .expect("dynamic Personal Delegate filter must not be a kinds wildcard");
+        assert_eq!(dynamic_kinds.as_slice(), [KIND_STREAM_MESSAGE]);
+        assert!(!dynamic.require_mention);
     }
 
     #[test]
