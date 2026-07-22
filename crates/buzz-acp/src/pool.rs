@@ -4941,6 +4941,7 @@ mod tests {
             &["-c".to_string(), "sleep 10".to_string()],
             &[],
             false,
+            crate::acp::CapabilityPolicy::Default,
         )
         .await
         .expect("failed to spawn test agent");
@@ -4999,6 +5000,7 @@ mod tests {
             &["-c".to_string(), "sleep 10".to_string()],
             &[],
             false,
+            crate::acp::CapabilityPolicy::Default,
         )
         .await
         .expect("failed to spawn test agent");

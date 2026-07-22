@@ -428,6 +428,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         let author_hex = buzz_event.event.pubkey.to_hex();
         let allowed = author_allowed(
             &config.respond_to,
+            config.no_sibling_responses,
             &config.respond_to_allowlist,
             &author_hex,
             &owner_cache,

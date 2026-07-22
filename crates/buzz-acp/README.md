@@ -97,16 +97,22 @@ All configuration is via environment variables (or CLI flags — every env var h
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BUZZ_PRIVATE_KEY` | **yes** | — | Agent's Nostr private key (`nsec1...`). Used for relay auth and agent identity. |
+| `BUZZ_PRIVATE_KEY` | **yes*** | — | Agent's Nostr private key (`nsec1...`). Used for relay auth and agent identity. |
 | `BUZZ_RELAY_URL` | no | `ws://localhost:3000` | Relay WebSocket URL. |
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
+| `BUZZ_ACP_PERSONAL_DELEGATE_MCP_CONFIG` | no | unset | Absolute config path that attaches Personal Delegate for this ACP process only; requires `BUZZ_ACP_PERSONAL_DELEGATE_MCP_COMMAND`. |
+| `BUZZ_ACP_PERSONAL_DELEGATE_MCP_COMMAND` | no | unset | Absolute, supervisor-pinned executable for the Personal Delegate MCP. It receives neither `BUZZ_PRIVATE_KEY` nor `BUZZ_AUTH_TAG`. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
+
+*On Unix, `--private-key-fd <3..1024>` is the secure alternative to `BUZZ_PRIVATE_KEY`: Buzz ACP reads one bounded key value from the inherited descriptor and closes that descriptor. It is intended for a launchd/supervisor handoff and conflicts with `BUZZ_PRIVATE_KEY`.
+
+Use `--no-sibling-responses` / `BUZZ_ACP_NO_SIBLING_RESPONSES=1` with `--respond-to owner-only` when a supervised identity must accept messages from only its direct configured owner; the default continues to admit same-owner sibling agents.
 
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
 

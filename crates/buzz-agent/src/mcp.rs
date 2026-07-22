@@ -63,6 +63,34 @@ const PASSTHROUGH_ENV: &[&str] = &[
     "BUZZ_AUTH_TAG",
 ];
 
+/// Personal Delegate is launched under a supervisor that owns one complete
+/// process group. Its one approved MCP process must remain in that group so a
+/// stop/revocation kills the agent and MCP child together. Ordinary buzz-agent
+/// sessions retain the independent process-group behavior below.
+fn personal_delegate_mode() -> bool {
+    std::env::var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE").as_deref() == Ok("1")
+}
+
+/// Whether MCP children should create a private process group.
+///
+/// Personal Delegate returns `false` so the MCP server stays in the supervisor
+/// group. Ordinary sessions return `true` and store the child PID as a killpg
+/// handle (pid == pgid after `process_group(0)`).
+fn mcp_uses_private_process_group() -> bool {
+    !personal_delegate_mode()
+}
+
+/// Kill handle recorded for an MCP child. `None` for Personal Delegate so
+/// cleanup never calls `killpg` with a PID that is not a process-group leader
+/// (which would either no-op or, worse, target the wrong group).
+fn mcp_kill_handle(child_pid: Option<u32>) -> Option<u32> {
+    if mcp_uses_private_process_group() {
+        child_pid
+    } else {
+        None
+    }
+}
+
 // Windows has no $TMPDIR/$HOME. TMP/TEMP/USERPROFILE are what
 // std::env::temp_dir() consults — without them it falls back to C:\Windows,
 // which child processes can't write to (PermissionDenied). USERPROFILE is the
@@ -730,11 +758,13 @@ async fn spawn_one(
     cmd.stderr(std::process::Stdio::inherit());
 
     #[cfg(unix)]
-    cmd.process_group(0);
+    if mcp_uses_private_process_group() {
+        cmd.process_group(0);
+    }
 
     let transport = TokioChildProcess::new(cmd)
         .map_err(|e| AgentError::Mcp(format!("spawn {}: {e}", spec.name)))?;
-    let pgid = transport.id();
+    let pgid = mcp_kill_handle(transport.id());
 
     struct PgidGuard {
         pgid: Option<u32>,
@@ -1097,5 +1127,92 @@ mod content_tests {
             assert!(std::str::from_utf8(out.as_bytes()).is_ok());
         }
         assert_eq!(super::truncate_middle("ok", 1024), "ok");
+    }
+
+    #[test]
+    fn personal_delegate_mode_keeps_mcp_in_supervisor_group_defaults_private() {
+        use std::sync::{Mutex, OnceLock};
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let prior = std::env::var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE").ok();
+        std::env::remove_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE");
+        assert!(
+            super::mcp_uses_private_process_group(),
+            "default buzz-agent MCP children still use a private process group"
+        );
+        assert_eq!(super::mcp_kill_handle(Some(4242)), Some(4242));
+
+        std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", "1");
+        assert!(
+            !super::mcp_uses_private_process_group(),
+            "Personal Delegate MCP must remain in the supervisor process group"
+        );
+        assert_eq!(
+            super::mcp_kill_handle(Some(4242)),
+            None,
+            "Personal Delegate must not record a killpg handle"
+        );
+
+        match prior {
+            Some(value) => std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", value),
+            None => std::env::remove_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn personal_delegate_mcp_child_shares_supervisor_pgid() {
+        use nix::unistd::{getpgid, Pid};
+        use std::sync::OnceLock;
+        use tokio::process::Command;
+        use tokio::sync::Mutex;
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
+        let prior = std::env::var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE").ok();
+        let supervisor_pgid = getpgid(None).expect("supervisor pgid");
+
+        std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", "1");
+        let mut pd_cmd = Command::new("sleep");
+        pd_cmd.arg("30");
+        if super::mcp_uses_private_process_group() {
+            pd_cmd.process_group(0);
+        }
+        let mut pd_child = pd_cmd.spawn().expect("spawn pd mcp stand-in");
+        let pd_pid = pd_child.id().expect("pd pid") as i32;
+        let pd_pgid = getpgid(Some(Pid::from_raw(pd_pid))).expect("pd pgid");
+        assert_eq!(pd_pgid, supervisor_pgid);
+        assert_eq!(super::mcp_kill_handle(Some(pd_pid as u32)), None);
+        let _ = pd_child.start_kill();
+        let _ = pd_child.wait().await;
+
+        std::env::remove_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE");
+        let mut default_cmd = Command::new("sleep");
+        default_cmd.arg("30");
+        if super::mcp_uses_private_process_group() {
+            default_cmd.process_group(0);
+        }
+        let mut default_child = default_cmd.spawn().expect("spawn default mcp stand-in");
+        let default_pid = default_child.id().expect("default pid") as i32;
+        let default_pgid = getpgid(Some(Pid::from_raw(default_pid))).expect("default pgid");
+        assert_eq!(default_pgid, Pid::from_raw(default_pid));
+        assert_ne!(default_pgid, supervisor_pgid);
+        assert_eq!(
+            super::mcp_kill_handle(Some(default_pid as u32)),
+            Some(default_pid as u32)
+        );
+        let _ = default_child.start_kill();
+        let _ = default_child.wait().await;
+
+        match prior {
+            Some(value) => std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", value),
+            None => std::env::remove_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE"),
+        }
     }
 }

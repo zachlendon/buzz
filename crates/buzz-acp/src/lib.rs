@@ -196,6 +196,7 @@ async fn is_owner_or_sibling(
 /// additionally accepts the explicit external pubkey list.
 async fn author_allowed(
     respond_to: &RespondTo,
+    no_sibling_responses: bool,
     allowlist: &HashSet<String>,
     author: &str,
     owner_cache: &OwnerCache,
@@ -204,10 +205,15 @@ async fn author_allowed(
     match respond_to {
         RespondTo::Anyone => true,
         RespondTo::Nobody => false,
+        RespondTo::OwnerOnly if no_sibling_responses => owner_cache.get() == Some(author),
         RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
         RespondTo::Allowlist => {
             allowlist.contains(author)
-                || is_owner_or_sibling(author, owner_cache, rest_client).await
+                || if no_sibling_responses {
+                    owner_cache.get() == Some(author)
+                } else {
+                    is_owner_or_sibling(author, owner_cache, rest_client).await
+                }
         }
     }
 }
@@ -1255,6 +1261,11 @@ async fn tokio_main() -> Result<()> {
             &config.agent_args,
             &config.persona_env_vars,
             config.has_generated_codex_config,
+            if config.personal_delegate_mode {
+                acp::CapabilityPolicy::PersonalDelegateMcpOnly
+            } else {
+                acp::CapabilityPolicy::Default
+            },
         )
         .await;
         match spawn_result {
@@ -1717,10 +1728,20 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let personal_delegate = config.personal_delegate_mode;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        personal_delegate,
+                        idx,
+                        observer,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -2064,6 +2085,7 @@ async fn tokio_main() -> Result<()> {
                                 let author = buzz_event.event.pubkey.to_hex();
                                 let allowed = author_allowed(
                                     &config.respond_to,
+                                    config.no_sibling_responses,
                                     &config.respond_to_allowlist,
                                     &author,
                                     &owner_cache,
@@ -3284,12 +3306,14 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let personal_delegate = config.personal_delegate_mode;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, personal_delegate, i, observer).await;
         guard.send(result);
     });
 }
@@ -3462,6 +3486,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let personal_delegate = config.personal_delegate_mode;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -3473,7 +3498,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            personal_delegate,
+            index,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -3501,12 +3535,24 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    personal_delegate_mode: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    let capability_policy = if personal_delegate_mode {
+        acp::CapabilityPolicy::PersonalDelegateMcpOnly
+    } else {
+        acp::CapabilityPolicy::Default
+    };
+    let mut acp = AcpClient::spawn(
+        command,
+        args,
+        extra_env,
+        has_generated_codex_config,
+        capability_policy,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -3535,7 +3581,14 @@ async fn spawn_and_init(
 
 async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
     let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
-    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
+    AcpClient::spawn(
+        &agent.agent_command,
+        &agent_args,
+        &[],
+        false,
+        acp::CapabilityPolicy::Default,
+    )
+    .await
 }
 
 fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -3664,14 +3717,21 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
-    let mut client =
-        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: failed to spawn agent: {e}");
-                std::process::exit(1);
-            }
-        };
+    let mut client = match AcpClient::spawn(
+        &args.agent.agent_command,
+        &agent_args,
+        &[],
+        false,
+        acp::CapabilityPolicy::Default,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to spawn agent: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Initialize + session/new under a timeout. Client is owned above,
     // so shutdown() runs on all paths (success, error, timeout).
@@ -3790,48 +3850,84 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
-        return vec![];
+    if config.personal_delegate_mode {
+        let config_path = config
+            .personal_delegate_mcp_config
+            .as_deref()
+            .expect("Personal Delegate config was validated at startup");
+        let command = config
+            .personal_delegate_mcp_command
+            .as_deref()
+            .expect("Personal Delegate command was validated at startup");
+        return vec![mcp_server(
+            "personal-delegate",
+            command.display().to_string(),
+            vec!["--config".to_string(), config_path.display().to_string()],
+            config,
+            false,
+        )];
     }
-    vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
-            .to_string(),
-        command: config.mcp_command.clone(),
-        args: vec![],
-        env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
-                    // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
-                    value: config
-                        .keys
-                        .secret_key()
-                        .to_bech32()
-                        .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
-                }
+
+    let mut servers = Vec::new();
+    if !config.mcp_command.is_empty() {
+        servers.push(mcp_server(
+            std::path::Path::new(&config.mcp_command)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("mcp"),
+            config.mcp_command.clone(),
+            vec![],
+            config,
+            true,
+        ));
+    }
+
+    servers
+}
+
+/// Build an MCP server. Personal Delegate has no reason to sign as the agent,
+/// so its MCP process receives no Buzz credentials or NIP-OA attestation.
+fn mcp_server(
+    name: &str,
+    command: String,
+    args: Vec<String>,
+    config: &Config,
+    forward_buzz_identity: bool,
+) -> McpServer {
+    let mut env = Vec::new();
+    if forward_buzz_identity {
+        env.push(EnvVar {
+            name: "BUZZ_RELAY_URL".into(),
+            value: config.relay_url.clone(),
+        });
+        env.push(EnvVar {
+            name: "BUZZ_PRIVATE_KEY".into(),
+            // bech32 encoding of a valid secret key is infallible.
+            value: config
+                .keys
+                .secret_key()
+                .to_bech32()
+                .expect("secret key bech32 encoding should never fail"),
+        });
+    }
+    // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential) so the MCP
+    // server can attach it to every signed event.
+    if forward_buzz_identity {
+        if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+            if !auth_tag.is_empty() {
+                env.push(EnvVar {
+                    name: "BUZZ_AUTH_TAG".into(),
+                    value: auth_tag,
+                });
             }
-            env
-        },
-    }]
+        }
+    }
+    McpServer {
+        name: name.to_string(),
+        command,
+        args,
+        env,
+    }
 }
 
 #[cfg(test)]
@@ -4053,6 +4149,7 @@ mod author_gate_tests {
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
+                false,
                 &allowlist,
                 SIBLING,
                 &cache,
@@ -4070,6 +4167,7 @@ mod author_gate_tests {
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
+                false,
                 &allowlist,
                 EXTERNAL,
                 &cache,
@@ -4087,6 +4185,7 @@ mod author_gate_tests {
         assert!(
             !author_allowed(
                 &RespondTo::Allowlist,
+                false,
                 &allowlist,
                 STRANGER,
                 &cache,
@@ -4104,6 +4203,7 @@ mod author_gate_tests {
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
+                false,
                 &allowlist,
                 OWNER,
                 &cache,
@@ -4124,6 +4224,7 @@ mod author_gate_tests {
         assert!(
             !author_allowed(
                 &RespondTo::OwnerOnly,
+                false,
                 &HashSet::new(),
                 STRANGER,
                 &cache,
@@ -4141,6 +4242,7 @@ mod author_gate_tests {
             assert!(
                 author_allowed(
                     &RespondTo::OwnerOnly,
+                    false,
                     &HashSet::new(),
                     who,
                     &cache,
@@ -4150,6 +4252,34 @@ mod author_gate_tests {
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn no_sibling_responses_admits_direct_owner_and_rejects_sibling() {
+        let cache = cache_with_sibling();
+        let client = dummy_rest_client();
+        assert!(
+            author_allowed(
+                &RespondTo::OwnerOnly,
+                true,
+                &HashSet::new(),
+                OWNER,
+                &cache,
+                &client,
+            )
+            .await
+        );
+        assert!(
+            !author_allowed(
+                &RespondTo::OwnerOnly,
+                true,
+                &HashSet::new(),
+                SIBLING,
+                &cache,
+                &client,
+            )
+            .await
+        );
     }
 }
 
@@ -4365,6 +4495,9 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            personal_delegate_mcp_config: None,
+            personal_delegate_mcp_command: None,
+            personal_delegate_mode: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -4390,6 +4523,7 @@ mod build_mcp_servers_tests {
             model: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
+            no_sibling_responses: false,
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
@@ -4462,6 +4596,32 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn personal_delegate_mcp_is_the_only_exposed_mcp_and_receives_no_buzz_identity() {
+        let mut config = test_config();
+        config.personal_delegate_mcp_config = Some("/tmp/personal-delegate.json".into());
+        config.personal_delegate_mcp_command = Some("/opt/pd/personal-delegate-mcp".into());
+        config.personal_delegate_mode = true;
+
+        let servers = build_mcp_servers(&config);
+        assert_eq!(
+            servers.len(),
+            1,
+            "no catalog or generic MCP may be attached"
+        );
+        let delegate = &servers[0];
+        assert_eq!(delegate.name, "personal-delegate");
+        assert_eq!(delegate.command, "/opt/pd/personal-delegate-mcp");
+        assert_eq!(
+            delegate.args,
+            vec!["--config", "/tmp/personal-delegate.json"]
+        );
+        assert!(
+            delegate.env.is_empty(),
+            "delegate must not receive agent identity"
+        );
+    }
+
+    #[test]
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
         config.mcp_command = "/opt/bin/my-mcp-server".into();
@@ -4530,6 +4690,9 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            personal_delegate_mcp_config: None,
+            personal_delegate_mcp_command: None,
+            personal_delegate_mode: false,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -4555,6 +4718,7 @@ mod error_outcome_emission_tests {
             model: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
+            no_sibling_responses: false,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
             persona_env_vars: vec![],
@@ -4588,7 +4752,7 @@ mod error_outcome_emission_tests {
     async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
-            acp: AcpClient::spawn("cat", &[], &[], false)
+            acp: AcpClient::spawn("cat", &[], &[], false, acp::CapabilityPolicy::Default)
                 .await
                 .expect("spawn cat as inert agent"),
             state: Default::default(),

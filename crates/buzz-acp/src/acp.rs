@@ -39,6 +39,73 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// Spawn-time capability policy for the ACP child.
+///
+/// Personal Delegate sessions use an exact MCP-only allowlist and must never
+/// inherit the harness's ordinary auto-approval behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityPolicy {
+    Default,
+    PersonalDelegateMcpOnly,
+}
+
+/// Ambient keys stripped from a Personal Delegate child before the fixed
+/// loopback Ollama environment is force-applied. Includes foreign-agent,
+/// multi-provider, and Buzz credential variables that must never reach the
+/// confined native buzz-agent process.
+const PERSONAL_DELEGATE_AMBIENT_STRIP: &[&str] = &[
+    "CODEX_CONFIG",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_COMPAT_API_KEY",
+    "OPENAI_COMPAT_BASE_URL",
+    "OPENAI_COMPAT_MODEL",
+    "OPENAI_COMPAT_API",
+    "BUZZ_AGENT_PROVIDER",
+    "BUZZ_AGENT_MODEL",
+    "BUZZ_AGENT_SYSTEM_PROMPT",
+    "BUZZ_AGENT_SYSTEM_PROMPT_FILE",
+    "BUZZ_AGENT_NO_HINTS",
+    "BUZZ_AGENT_PERSONAL_DELEGATE_MODE",
+    "BUZZ_AGENT_MAX_PARALLEL_TOOLS",
+    "MCP_HOOK_SERVERS",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_BASE_URL",
+    "DATABRICKS_HOST",
+    "DATABRICKS_MODEL",
+    "DATABRICKS_TOKEN",
+    "BUZZ_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_RELAY_URL",
+];
+
+/// Select the only permission outcome permitted by the spawn policy.
+///
+/// Kept separate from wire I/O so the fail-closed Personal Delegate rule has a
+/// direct unit-test surface.
+fn select_permission_option(
+    options: &[serde_json::Value],
+    policy: CapabilityPolicy,
+) -> Result<&str, AcpError> {
+    let required_kind = match policy {
+        CapabilityPolicy::Default => "allow_once",
+        CapabilityPolicy::PersonalDelegateMcpOnly => "reject_once",
+    };
+    let option = options
+        .iter()
+        .find(|opt| opt.get("kind").and_then(|kind| kind.as_str()) == Some(required_kind))
+        .ok_or_else(|| {
+            AcpError::Protocol(format!(
+                "permission request has no {required_kind} option for {policy:?}"
+            ))
+        })?;
+    option["optionId"]
+        .as_str()
+        .ok_or_else(|| AcpError::Protocol(format!("{required_kind} option missing optionId")))
+}
+
 /// Stop reason returned by `session/prompt` when the agent finishes a turn.
 ///
 /// Maps to the `stopReason` field in the `SessionPromptResponse`.
@@ -170,6 +237,8 @@ pub struct AcpClient {
     observer: Option<ObserverHandle>,
     /// Pool slot index for this agent process.
     observer_agent_index: Option<usize>,
+    /// Whether permission escalations must fail closed for this child.
+    capability_policy: CapabilityPolicy,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
     /// Most recently observed `_meta.goose.activeRunId` from a
@@ -381,10 +450,18 @@ impl AcpClient {
         //
         // Falls back to start_kill() (direct child only) on non-Unix or if
         // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
+        if self.capability_policy == CapabilityPolicy::PersonalDelegateMcpOnly {
+            // Personal Delegate intentionally remains in its supervisor's
+            // process group.  Killing its own PID as a PGID would kill the
+            // Buzz harness/supervisor too; launchd supervision owns recursive
+            // descendant cleanup for this bounded mode.
+            let _ = self.child.start_kill();
+        } else {
+            match self.child.id() {
+                Some(pid) if kill_process_group(pid) => {}
+                _ => {
+                    let _ = self.child.start_kill();
+                }
             }
         }
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
@@ -402,7 +479,8 @@ impl AcpClient {
     /// `has_generated_codex_config` must be true when `codex_network_env()` successfully
     /// injected a `CODEX_CONFIG` entry into `extra_env`.  The spawn path uses it to
     /// trigger the recursive merge + forced `network_access=true` in
-    /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
+    /// `build_codex_config_env`.  Pass `false` for test spawns, non-Codex agents, and
+    /// Personal Delegate (which never uses Codex configuration).
     ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
     pub async fn spawn(
@@ -410,6 +488,7 @@ impl AcpClient {
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
+        capability_policy: CapabilityPolicy,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
@@ -423,48 +502,67 @@ impl AcpClient {
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
 
-        // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
-        // For most keys, operator precedence wins: skip injection if already set
-        // in the parent environment.
-        //
-        // CODEX_CONFIG is handled specially via build_codex_config_env:
-        //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
-        //     recursively and force network_access=true.
-        //   • has_generated_codex_config=false: return None; any persona-supplied
-        //     CODEX_CONFIG falls through to the normal operator-wins loop below.
-        let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
-        let parent_codex_config = if has_generated_codex_config && has_codex_config {
-            std::env::var("CODEX_CONFIG").ok()
-        } else {
-            None
-        };
-        let codex_config_value = build_codex_config_env(
-            extra_env,
-            parent_codex_config.as_deref(),
-            has_generated_codex_config,
-        )?;
-        // When the merge path was not taken (None returned), any persona CODEX_CONFIG
-        // entry falls through to the standard operator-wins treatment below.
-        let codex_merge_active = codex_config_value.is_some();
-
-        for (key, value) in extra_env {
-            if key == "CODEX_CONFIG" && codex_merge_active {
-                // Handled by build_codex_config_env; skip here to avoid double-setting.
-                continue;
+        if capability_policy == CapabilityPolicy::PersonalDelegateMcpOnly {
+            // Native buzz-agent Personal Delegate: clear hostile ambient provider,
+            // model, credential, and hint overrides, then unconditionally force the
+            // fixed loopback Ollama environment. Operator-wins and CODEX_CONFIG
+            // merges never apply on this path.
+            for key in PERSONAL_DELEGATE_AMBIENT_STRIP {
+                cmd.env_remove(key);
             }
-            if std::env::var(key).is_err() {
+            // Force the harness-owned fixed set first so ambient parent values for
+            // the same keys cannot survive even if extra_env is incomplete.
+            for (key, value) in crate::config::PERSONAL_DELEGATE_AGENT_ENV {
+                cmd.env(*key, *value);
+            }
+            for (key, value) in extra_env {
                 cmd.env(key, value);
             }
-        }
-        if let Some(merged) = codex_config_value {
-            cmd.env("CODEX_CONFIG", merged);
-        }
+        } else {
+            // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
+            // For most keys, operator precedence wins: skip injection if already set
+            // in the parent environment.
+            //
+            // CODEX_CONFIG is handled specially via build_codex_config_env:
+            //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
+            //     recursively and force network_access=true.
+            //   • has_generated_codex_config=false: return None; any persona-supplied
+            //     CODEX_CONFIG falls through to the normal operator-wins loop below.
+            let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
+            let parent_codex_config = if has_generated_codex_config && has_codex_config {
+                std::env::var("CODEX_CONFIG").ok()
+            } else {
+                None
+            };
+            let codex_config_value = build_codex_config_env(
+                extra_env,
+                parent_codex_config.as_deref(),
+                has_generated_codex_config,
+            )?;
+            // When the merge path was not taken (None returned), any persona CODEX_CONFIG
+            // entry falls through to the standard operator-wins treatment below.
+            let codex_merge_active = codex_config_value.is_some();
 
-        // Spawn the agent in its own process group so SIGKILL doesn't propagate
-        // to the harness's own process group on Unix.
-        // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
-        #[cfg(unix)]
-        cmd.process_group(0);
+            for (key, value) in extra_env {
+                if key == "CODEX_CONFIG" && codex_merge_active {
+                    // Handled by build_codex_config_env; skip here to avoid double-setting.
+                    continue;
+                }
+                if std::env::var(key).is_err() {
+                    cmd.env(key, value);
+                }
+            }
+            if let Some(merged) = codex_config_value {
+                cmd.env("CODEX_CONFIG", merged);
+            }
+
+            // Ordinary agents get a private process group so their descendants can
+            // be reaped by AcpClient. Personal Delegate stays in the supervisor's
+            // group (handled above by skipping this branch entirely).
+            // tokio::process::Command::process_group is a stable tokio API.
+            #[cfg(unix)]
+            cmd.process_group(0);
+        }
 
         let mut child = cmd.spawn()?;
 
@@ -488,6 +586,7 @@ impl AcpClient {
             current_hard_deadline: None,
             observer: None,
             observer_agent_index: None,
+            capability_policy,
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steer_rx: None,
@@ -1664,10 +1763,12 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Handle a `session/request_permission` request from the agent.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// Ordinary agents preserve the historical `allow_once` behavior. A
+    /// Personal Delegate session rejects every escalation: all intended
+    /// capability must arrive through its named MCP server, never a native
+    /// shell, filesystem, network, or Keychain-capable tool.
     ///
     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
     ///
@@ -1695,15 +1796,14 @@ impl AcpClient {
             options.len()
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
-
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
+        let response = if self.capability_policy == CapabilityPolicy::PersonalDelegateMcpOnly {
+            let option_id = select_permission_option(options, self.capability_policy)?;
+            tracing::warn!(
+                target: "acp::permission",
+                "rejecting Personal Delegate permission escalation id={id} optionId={option_id:?}"
+            );
+            permission_response_selected(&id, option_id)
+        } else if let Ok(option_id) = select_permission_option(options, self.capability_policy) {
             tracing::info!(
                 target: "acp::permission",
                 "auto-approving permission id={id} with allow_once optionId={option_id:?}"
@@ -1951,10 +2051,14 @@ impl Drop for AcpClient {
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
+        if self.capability_policy == CapabilityPolicy::PersonalDelegateMcpOnly {
+            let _ = self.child.start_kill();
+        } else {
+            match self.child.id() {
+                Some(pid) if kill_process_group(pid) => {}
+                _ => {
+                    let _ = self.child.start_kill();
+                }
             }
         }
         // Non-blocking reap attempt — prevents zombie accumulation in the
@@ -2092,6 +2196,231 @@ mod tests {
             .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
         assert!(reject_once.is_some());
         assert_eq!(reject_once.unwrap()["optionId"].as_str(), Some("rej-x"));
+    }
+
+    #[test]
+    fn personal_delegate_permission_policy_rejects_while_default_allows() {
+        let options: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+            {"optionId": "opt-reject-42",  "name": "Reject",     "kind": "reject_once"},
+            {"optionId": "opt-allow-99",   "name": "Allow once", "kind": "allow_once"}
+        ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_permission_option(&options, CapabilityPolicy::Default).unwrap(),
+            "opt-allow-99"
+        );
+        assert_eq!(
+            select_permission_option(&options, CapabilityPolicy::PersonalDelegateMcpOnly).unwrap(),
+            "opt-reject-42"
+        );
+
+        let allow_only: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"optionId": "opt-allow-99", "name": "Allow once", "kind": "allow_once"}]"#,
+        )
+        .unwrap();
+        assert!(
+            select_permission_option(&allow_only, CapabilityPolicy::PersonalDelegateMcpOnly)
+                .is_err(),
+            "Personal Delegate must fail closed when reject_once is absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn personal_delegate_child_stays_in_supervisor_process_group_default_gets_private() {
+        use nix::unistd::{getpgid, Pid};
+
+        let supervisor_pgid = getpgid(None).expect("supervisor pgid");
+
+        let mut pd = AcpClient::spawn(
+            "bash",
+            &["-c".into(), "sleep 30".into()],
+            &[],
+            false,
+            CapabilityPolicy::PersonalDelegateMcpOnly,
+        )
+        .await
+        .expect("spawn personal delegate child");
+        let pd_pid = pd.child.id().expect("pd pid") as i32;
+        let pd_pgid = getpgid(Some(Pid::from_raw(pd_pid))).expect("pd pgid");
+        assert_eq!(
+            pd_pgid, supervisor_pgid,
+            "Personal Delegate child must remain in the supervisor process group"
+        );
+        pd.shutdown().await;
+
+        let mut ordinary = AcpClient::spawn(
+            "bash",
+            &["-c".into(), "sleep 30".into()],
+            &[],
+            false,
+            CapabilityPolicy::Default,
+        )
+        .await
+        .expect("spawn ordinary child");
+        let ordinary_pid = ordinary.child.id().expect("ordinary pid") as i32;
+        let ordinary_pgid = getpgid(Some(Pid::from_raw(ordinary_pid))).expect("ordinary pgid");
+        assert_eq!(
+            ordinary_pgid,
+            Pid::from_raw(ordinary_pid),
+            "default agents still get a private process group (pid == pgid)"
+        );
+        assert_ne!(
+            ordinary_pgid, supervisor_pgid,
+            "default process group must differ from the supervisor"
+        );
+        ordinary.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn personal_delegate_spawn_forces_fixed_env_and_strips_ambient_credentials() {
+        use futures_util::StreamExt;
+        use std::sync::OnceLock;
+        use tokio::sync::Mutex;
+
+        // Serialize ambient env mutation so parallel tests cannot observe
+        // temporary OPENAI_*/BUZZ_* values set only for this probe.
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
+        // Hostile parent ambient values: credentials, provider, model, and
+        // BUZZ_AGENT_NO_HINTS=0 must not reach the child. Fixed Ollama env wins
+        // unconditionally (no operator-wins).
+        let ambient = [
+            ("OPENAI_API_KEY", "ambient-openai-key"),
+            ("OPENAI_COMPAT_BASE_URL", "https://evil.example/v1"),
+            ("OPENAI_COMPAT_MODEL", "ambient-model"),
+            ("OPENAI_COMPAT_API_KEY", "ambient-compat-key"),
+            ("BUZZ_PRIVATE_KEY", "nsec1ambient"),
+            ("BUZZ_AUTH_TAG", "ambient-auth-tag"),
+            ("BUZZ_RELAY_URL", "wss://ambient.example"),
+            ("ANTHROPIC_API_KEY", "ambient-anthropic"),
+            ("CODEX_CONFIG", "{\"sandbox_mode\":\"danger-full-access\"}"),
+            ("BUZZ_AGENT_PROVIDER", "anthropic"),
+            ("BUZZ_AGENT_MODEL", "hostile-remote-model"),
+            ("BUZZ_AGENT_NO_HINTS", "0"),
+        ];
+        let previous: Vec<(String, Option<String>)> = ambient
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        for (key, value) in ambient {
+            // SAFETY: test-only ambient env setup, restored below under ENV_LOCK.
+            std::env::set_var(key, value);
+        }
+
+        // Empty extra_env proves the harness forces PERSONAL_DELEGATE_AGENT_ENV
+        // itself after clearing ambient keys (not only when callers re-supply it).
+        let fixed: Vec<(String, String)> = Vec::new();
+
+        let script = r#"
+printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-<unset>}"
+printf 'OPENAI_COMPAT_BASE_URL=%s\n' "${OPENAI_COMPAT_BASE_URL-<unset>}"
+printf 'OPENAI_COMPAT_MODEL=%s\n' "${OPENAI_COMPAT_MODEL-<unset>}"
+printf 'OPENAI_COMPAT_API_KEY=%s\n' "${OPENAI_COMPAT_API_KEY-<unset>}"
+printf 'BUZZ_PRIVATE_KEY=%s\n' "${BUZZ_PRIVATE_KEY-<unset>}"
+printf 'BUZZ_AUTH_TAG=%s\n' "${BUZZ_AUTH_TAG-<unset>}"
+printf 'BUZZ_RELAY_URL=%s\n' "${BUZZ_RELAY_URL-<unset>}"
+printf 'ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-<unset>}"
+printf 'CODEX_CONFIG=%s\n' "${CODEX_CONFIG-<unset>}"
+printf 'BUZZ_AGENT_PROVIDER=%s\n' "${BUZZ_AGENT_PROVIDER-<unset>}"
+printf 'BUZZ_AGENT_MODEL=%s\n' "${BUZZ_AGENT_MODEL-<unset>}"
+printf 'BUZZ_AGENT_NO_HINTS=%s\n' "${BUZZ_AGENT_NO_HINTS-<unset>}"
+printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_MODE-<unset>}"
+"#;
+
+        let result = async {
+            let mut client = AcpClient::spawn(
+                "bash",
+                &["-c".into(), script.into()],
+                &fixed,
+                false,
+                CapabilityPolicy::PersonalDelegateMcpOnly,
+            )
+            .await
+            .expect("spawn env probe");
+
+            let mut output = String::new();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), client.reader.next())
+                    .await
+                {
+                    Ok(Some(Ok(line))) => {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                    Ok(Some(Err(e))) => panic!("read failed: {e}"),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            client.shutdown().await;
+            output
+        }
+        .await;
+
+        for (key, prior) in previous {
+            match prior {
+                Some(value) => std::env::set_var(&key, value),
+                None => std::env::remove_var(&key),
+            }
+        }
+
+        assert!(
+            result.contains("OPENAI_API_KEY=<unset>"),
+            "ambient OpenAI key must be stripped: {result}"
+        );
+        assert!(
+            result.contains("OPENAI_COMPAT_BASE_URL=http://127.0.0.1:11434/v1"),
+            "fixed Ollama base URL must be forced: {result}"
+        );
+        assert!(
+            result.contains("OPENAI_COMPAT_MODEL=llama3.1:8b"),
+            "fixed model must be forced: {result}"
+        );
+        assert!(
+            result.contains("OPENAI_COMPAT_API_KEY=ollama-local-only"),
+            "fixed non-secret sentinel must be forced: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_PRIVATE_KEY=<unset>"),
+            "Buzz private key must not reach the child: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AUTH_TAG=<unset>"),
+            "Buzz auth tag must not reach the child: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_RELAY_URL=<unset>"),
+            "Buzz relay URL must not reach the child: {result}"
+        );
+        assert!(
+            result.contains("ANTHROPIC_API_KEY=<unset>"),
+            "ambient Anthropic key must be stripped: {result}"
+        );
+        assert!(
+            result.contains("CODEX_CONFIG=<unset>"),
+            "CODEX_CONFIG must never be injected for Personal Delegate: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_PROVIDER=openai"),
+            "fixed provider must win over ambient anthropic: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_MODEL=<unset>"),
+            "hostile BUZZ_AGENT_MODEL must be stripped (model is OPENAI_COMPAT_MODEL only): {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_NO_HINTS=1"),
+            "hostile BUZZ_AGENT_NO_HINTS=0 must be overridden to 1: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_PERSONAL_DELEGATE_MODE=1"),
+            "Personal Delegate mode flag must be set: {result}"
+        );
     }
 
     #[test]
@@ -2585,9 +2914,15 @@ mod tests {
     }
 
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
-            .await
-            .expect("failed to spawn test script")
+        AcpClient::spawn(
+            "bash",
+            &["-c".into(), script.into()],
+            &[],
+            false,
+            CapabilityPolicy::Default,
+        )
+        .await
+        .expect("failed to spawn test script")
     }
 
     #[tokio::test]
@@ -3041,7 +3376,7 @@ mod tests {
     /// which is fine — these tests don't read from the agent, they just
     /// feed JSON into the parser.
     async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[], false)
+        AcpClient::spawn("cat", &[], &[], false, CapabilityPolicy::Default)
             .await
             .expect("spawn cat as inert client")
     }

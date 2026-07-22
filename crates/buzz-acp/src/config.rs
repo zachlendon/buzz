@@ -4,7 +4,7 @@
 //! Config file (TOML) for complex subscription rules.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use clap::ValueEnum;
@@ -45,6 +45,120 @@ pub enum ConfigError {
 
     #[error("config file error: {0}")]
     ConfigFile(String),
+}
+
+const MIN_PRIVATE_KEY_FD: u32 = 3;
+const MAX_PRIVATE_KEY_FD: u32 = 1024;
+const PRIVATE_KEY_FD_MAX_LEN: usize = 256;
+
+/// Fixed, non-secret environment for the Personal Delegate native agent.
+///
+/// `buzz-agent` has no native shell, filesystem, browser, or Keychain tools:
+/// it can only invoke MCP tools supplied by the ACP client.  Its model traffic
+/// is constrained to the local Ollama loopback endpoint.  Hints are disabled
+/// so no project instructions or skills become an additional file-read path.
+pub(crate) const PERSONAL_DELEGATE_AGENT_ENV: &[(&str, &str)] = &[
+    ("BUZZ_AGENT_PROVIDER", "openai"),
+    ("OPENAI_COMPAT_BASE_URL", "http://127.0.0.1:11434/v1"),
+    ("OPENAI_COMPAT_MODEL", "llama3.1:8b"),
+    ("OPENAI_COMPAT_API", "chat"),
+    // Ollama does not authenticate locally, but buzz-agent requires this
+    // syntactically; it is a fixed non-secret sentinel, never a user key.
+    ("OPENAI_COMPAT_API_KEY", "ollama-local-only"),
+    ("BUZZ_AGENT_NO_HINTS", "1"),
+    ("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", "1"),
+    ("BUZZ_AGENT_MAX_PARALLEL_TOOLS", "1"),
+];
+
+fn parse_private_key_fd(value: &str) -> Result<u32, String> {
+    let fd: u32 = value
+        .parse()
+        .map_err(|_| "private-key-fd must be a non-negative integer".to_string())?;
+    if !(MIN_PRIVATE_KEY_FD..=MAX_PRIVATE_KEY_FD).contains(&fd) {
+        return Err(format!(
+            "private-key-fd must be between {MIN_PRIVATE_KEY_FD} and {MAX_PRIVATE_KEY_FD} (0/1/2 are reserved)"
+        ));
+    }
+    Ok(fd)
+}
+
+fn normalize_expected_pubkey(value: &str) -> Result<String, ConfigError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ConfigError::ConfigFile(
+            "expected pubkey must be exactly 64 hexadecimal characters".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_personal_delegate_mcp_command(path: &Path) -> Result<(), ConfigError> {
+    if !path.is_absolute() {
+        return Err(ConfigError::ConfigFile(
+            "Personal Delegate MCP command must be an absolute path".into(),
+        ));
+    }
+    if path.to_string_lossy().chars().any(char::is_control) {
+        return Err(ConfigError::ConfigFile(
+            "Personal Delegate MCP command must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_private_key_fd(fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigError> {
+    use std::io::Read;
+    use zeroize::Zeroize;
+
+    struct CloseOnDrop(std::os::fd::RawFd);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            let _ = nix::unistd::close(self.0);
+        }
+    }
+
+    let _close_original = CloseOnDrop(fd as std::os::fd::RawFd);
+    let mut file = std::fs::File::open(format!("/dev/fd/{fd}")).map_err(|_| {
+        ConfigError::ConfigFile("failed to read private key from inherited fd".into())
+    })?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(PRIVATE_KEY_FD_MAX_LEN + 1));
+    file.by_ref()
+        .take((PRIVATE_KEY_FD_MAX_LEN + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            ConfigError::ConfigFile("failed to read private key from inherited fd".into())
+        })?;
+    if bytes.len() > PRIVATE_KEY_FD_MAX_LEN {
+        return Err(ConfigError::ConfigFile(
+            "private key from inherited fd exceeds maximum length".into(),
+        ));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.is_empty() {
+        return Err(ConfigError::ConfigFile(
+            "private key from inherited fd is empty".into(),
+        ));
+    }
+    let raw = std::mem::take(&mut *bytes);
+    let key = String::from_utf8(raw).map_err(|error| {
+        let mut invalid = error.into_bytes();
+        invalid.zeroize();
+        ConfigError::ConfigFile("private key from inherited fd is not valid UTF-8".into())
+    })?;
+    Ok(zeroize::Zeroizing::new(key))
+}
+
+#[cfg(not(unix))]
+fn read_private_key_fd(_fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigError> {
+    Err(ConfigError::ConfigFile(
+        "--private-key-fd is only supported on Unix".into(),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -240,8 +354,24 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
     pub relay_url: String,
 
-    #[arg(long, env = "BUZZ_PRIVATE_KEY")]
-    pub private_key: String,
+    #[arg(
+        long,
+        env = "BUZZ_PRIVATE_KEY",
+        hide_env_values = true,
+        conflicts_with = "private_key_fd"
+    )]
+    pub private_key: Option<String>,
+
+    /// Read the Nostr private key from an inherited file descriptor instead
+    /// of argv or the environment. Unix only; the descriptor is closed after
+    /// the bounded read. Intended for a launchd/supervisor handoff.
+    #[arg(long, value_parser = parse_private_key_fd)]
+    pub private_key_fd: Option<u32>,
+
+    /// Expected 64-character hex public key for the supplied private key.
+    /// A supervisor uses this to bind a managed identity to this ACP process.
+    #[arg(long, env = "BUZZ_ACP_EXPECTED_PUBKEY")]
+    pub expected_pubkey: Option<String>,
 
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
@@ -260,6 +390,20 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
+
+    /// Absolute path to the Personal Delegate MCP configuration. When set,
+    /// the harness attaches the built-in `personal-delegate-mcp` integration
+    /// to this agent only. The command itself is intentionally not
+    /// configurable here: the integration is fixed to the Personal Delegate
+    /// executable and receives no Buzz identity or NIP-OA credential.
+    #[arg(long, env = "BUZZ_ACP_PERSONAL_DELEGATE_MCP_CONFIG")]
+    pub personal_delegate_mcp_config: Option<PathBuf>,
+
+    /// Absolute, supervisor-pinned Personal Delegate MCP executable. Required
+    /// whenever `--personal-delegate-mcp-config` is set so launchd never
+    /// resolves this integration from PATH.
+    #[arg(long, env = "BUZZ_ACP_PERSONAL_DELEGATE_MCP_COMMAND")]
+    pub personal_delegate_mcp_command: Option<PathBuf>,
 
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
@@ -447,6 +591,12 @@ pub struct CliArgs {
     )]
     pub respond_to: RespondTo,
 
+    /// In owner-only/allowlist modes, do not grant same-owner sibling agents
+    /// access through NIP-OA attestation. Explicit allowlist entries still
+    /// apply. Off by default to preserve established team-agent behavior.
+    #[arg(long, env = "BUZZ_ACP_NO_SIBLING_RESPONSES", default_value_t = false)]
+    pub no_sibling_responses: bool,
+
     /// Comma-separated 64-char hex pubkeys for allowlist mode.
     /// Owner pubkey is always implicitly included.
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
@@ -485,6 +635,15 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    /// Per-agent opt-in for the Personal Delegate MCP. This is a config path,
+    /// not a generic command override; see `CliArgs::personal_delegate_mcp_config`.
+    pub personal_delegate_mcp_config: Option<PathBuf>,
+    /// Absolute executable paired with `personal_delegate_mcp_config`.
+    pub personal_delegate_mcp_command: Option<PathBuf>,
+    /// True only for the capability-confined Personal Delegate launch path.
+    /// This changes the agent launch environment and makes the named MCP the
+    /// sole MCP server exposed to the session.
+    pub personal_delegate_mode: bool,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -522,6 +681,8 @@ pub struct Config {
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
+    /// Opt-in exact-owner behavior; see `CliArgs::no_sibling_responses`.
+    pub no_sibling_responses: bool,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
@@ -732,13 +893,43 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
-        let keys = Keys::parse(&args.private_key)?;
-        // Best-effort zeroize: overwrite the raw private key string to reduce
-        // exposure via core dumps or heap inspection (#41). Without the `zeroize`
-        // crate we can only clear the String — the allocator may retain copies.
-        args.private_key
-            .replace_range(.., &"0".repeat(args.private_key.len()));
-        args.private_key.clear();
+        let private_key = match args.private_key_fd {
+            Some(fd) => read_private_key_fd(fd)?,
+            None => zeroize::Zeroizing::new(args.private_key.take().ok_or_else(|| {
+                ConfigError::ConfigFile(
+                    "BUZZ_PRIVATE_KEY is required (use --private-key or --private-key-fd)".into(),
+                )
+            })?),
+        };
+        let keys = Keys::parse(private_key.as_str())?;
+        if let Some(expected) = args.expected_pubkey.as_deref() {
+            let expected = normalize_expected_pubkey(expected)?;
+            if keys.public_key().to_hex() != expected {
+                return Err(ConfigError::ConfigFile(
+                    "private key does not match expected public key".into(),
+                ));
+            }
+        }
+
+        match (
+            args.personal_delegate_mcp_config.as_ref(),
+            args.personal_delegate_mcp_command.as_ref(),
+        ) {
+            (Some(_), Some(command)) => validate_personal_delegate_mcp_command(command)?,
+            (Some(_), None) => {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate MCP command is required when its config is set".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate MCP config is required when its command is set".into(),
+                ));
+            }
+            (None, None) => {}
+        }
+
+        let personal_delegate_mode = args.personal_delegate_mcp_config.is_some();
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -805,6 +996,29 @@ impl Config {
         }
 
         let agent_args = normalize_agent_args(&agent_command, args.agent_args);
+
+        if personal_delegate_mode {
+            if normalize_agent_command_identity(&agent_command) != "buzz-agent" {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate mode requires the native buzz-agent runtime".into(),
+                ));
+            }
+            if !agent_args.is_empty() {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate mode does not permit agent arguments".into(),
+                ));
+            }
+            if !args.mcp_command.trim().is_empty() {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate mode does not permit a generic MCP command".into(),
+                ));
+            }
+            if args.agents != 1 {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate mode requires exactly one agent".into(),
+                ));
+            }
+        }
 
         if let Some(ref channels) = args.channels {
             for ch in channels {
@@ -939,16 +1153,24 @@ impl Config {
         let mut persona_env_vars = Vec::new();
         let model = args.model;
 
-        // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
-        // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
-        // for non-Codex agents or unparseable relay URLs.
-        let has_generated_codex_config =
-            if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
-                persona_env_vars.push(network_env);
-                true
-            } else {
-                false
-            };
+        // Ordinary Codex agents receive the relay-network configuration below.
+        // Personal Delegate instead uses the constrained native-agent route.
+        let has_generated_codex_config = if personal_delegate_mode {
+            // Do not use the general Codex relay-network widening here. The
+            // native buzz-agent has only MCP tools, and this fixed provider
+            // environment confines model traffic to loopback Ollama.
+            persona_env_vars.extend(
+                PERSONAL_DELEGATE_AGENT_ENV
+                    .iter()
+                    .map(|(key, value)| ((*key).into(), (*value).into())),
+            );
+            false
+        } else if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
+            persona_env_vars.push(network_env);
+            true
+        } else {
+            false
+        };
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
@@ -958,6 +1180,9 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            personal_delegate_mcp_config: args.personal_delegate_mcp_config,
+            personal_delegate_mcp_command: args.personal_delegate_mcp_command,
+            personal_delegate_mode,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -988,6 +1213,7 @@ impl Config {
             model,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
+            no_sibling_responses: args.no_sibling_responses,
             respond_to_allowlist,
             allowed_respond_to,
             persona_env_vars,
@@ -1331,6 +1557,9 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            personal_delegate_mcp_config: None,
+            personal_delegate_mcp_command: None,
+            personal_delegate_mode: false,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -1356,6 +1585,7 @@ mod tests {
             model: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
+            no_sibling_responses: false,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),
             persona_env_vars: vec![],
@@ -1365,6 +1595,288 @@ mod tests {
             no_base_prompt: false,
             base_prompt_content: None,
         }
+    }
+
+    #[test]
+    fn private_key_fd_rejects_standard_streams_and_accepts_inherited_fd_range() {
+        assert!(parse_private_key_fd("0").is_err());
+        assert!(parse_private_key_fd("2").is_err());
+        assert!(parse_private_key_fd("1025").is_err());
+        assert_eq!(parse_private_key_fd("3").unwrap(), 3);
+        assert_eq!(parse_private_key_fd("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn expected_pubkey_accepts_matching_key_after_normalization() {
+        use nostr::ToBech32;
+
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let expected = keys.public_key().to_hex().to_ascii_uppercase();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--expected-pubkey",
+            expected.as_str(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            Config::from_args(args).unwrap().keys.public_key(),
+            keys.public_key()
+        );
+    }
+
+    #[test]
+    fn expected_pubkey_rejects_mismatched_key() {
+        use nostr::ToBech32;
+
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let different_pubkey = Keys::generate().public_key().to_hex();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--expected-pubkey",
+            different_pubkey.as_str(),
+        ])
+        .unwrap();
+
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "config file error: private key does not match expected public key"
+        );
+    }
+
+    #[test]
+    fn expected_pubkey_rejects_malformed_value_before_startup() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--expected-pubkey",
+            "not-a-pubkey",
+        ])
+        .unwrap();
+
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "config file error: expected pubkey must be exactly 64 hexadecimal characters"
+        );
+    }
+
+    #[test]
+    fn personal_delegate_mcp_command_requires_absolute_control_free_path() {
+        assert!(validate_personal_delegate_mcp_command(&PathBuf::from(
+            "/opt/personal-delegate/personal-delegate-mcp"
+        ))
+        .is_ok());
+        assert!(
+            validate_personal_delegate_mcp_command(&PathBuf::from("personal-delegate-mcp"))
+                .is_err()
+        );
+        assert!(validate_personal_delegate_mcp_command(&PathBuf::from(
+            "/opt/personal\n-delegate-mcp"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn personal_delegate_mcp_config_requires_pinned_command() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--personal-delegate-mcp-config",
+            "/tmp/personal-delegate.json",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            Config::from_args(args).unwrap_err().to_string(),
+            "config file error: Personal Delegate MCP command is required when its config is set"
+        );
+    }
+
+    #[test]
+    fn personal_delegate_mode_requires_native_runtime_and_emits_loopback_configuration() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+        ])
+        .unwrap();
+
+        let config = Config::from_args(args).unwrap();
+        assert!(config.personal_delegate_mode);
+        assert!(config.mcp_command.is_empty());
+        assert!(config.agent_args.is_empty());
+        assert_eq!(
+            config.persona_env_vars,
+            vec![
+                ("BUZZ_AGENT_PROVIDER".to_string(), "openai".to_string(),),
+                (
+                    "OPENAI_COMPAT_BASE_URL".to_string(),
+                    "http://127.0.0.1:11434/v1".to_string(),
+                ),
+                ("OPENAI_COMPAT_MODEL".to_string(), "llama3.1:8b".to_string()),
+                ("OPENAI_COMPAT_API".to_string(), "chat".to_string()),
+                (
+                    "OPENAI_COMPAT_API_KEY".to_string(),
+                    "ollama-local-only".to_string(),
+                ),
+                ("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string()),
+                (
+                    "BUZZ_AGENT_PERSONAL_DELEGATE_MODE".to_string(),
+                    "1".to_string(),
+                ),
+                ("BUZZ_AGENT_MAX_PARALLEL_TOOLS".to_string(), "1".to_string(),),
+            ]
+        );
+        assert!(!config.has_generated_codex_config);
+    }
+
+    #[test]
+    fn personal_delegate_mode_rejects_generic_mcp_and_non_native_adapter() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "goose",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args)
+            .unwrap_err()
+            .to_string()
+            .contains("requires the native buzz-agent runtime"));
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "codex-acp",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+        ])
+        .unwrap();
+        assert!(
+            Config::from_args(args)
+                .unwrap_err()
+                .to_string()
+                .contains("requires the native buzz-agent runtime"),
+            "codex-acp must never be accepted as the Personal Delegate runtime"
+        );
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--mcp-command",
+            "/opt/other-mcp",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args)
+            .unwrap_err()
+            .to_string()
+            .contains("does not permit a generic MCP command"));
+    }
+
+    #[test]
+    fn personal_delegate_mode_rejects_agent_args_and_keeps_default_agent_args_elsewhere() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--agent-args=override-flag",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args)
+            .unwrap_err()
+            .to_string()
+            .contains("does not permit agent arguments"));
+
+        // Ordinary goose defaults are unchanged when Personal Delegate is off.
+        let ordinary = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "goose",
+        ])
+        .unwrap();
+        let ordinary = Config::from_args(ordinary).unwrap();
+        assert!(!ordinary.personal_delegate_mode);
+        assert_eq!(ordinary.agent_args, vec!["acp".to_string()]);
+        assert_eq!(ordinary.persona_env_vars, Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn personal_delegate_fixed_env_disables_hints_and_binds_local_ollama_only() {
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| *k == "BUZZ_AGENT_NO_HINTS" && *v == "1"));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| *k == "BUZZ_AGENT_PERSONAL_DELEGATE_MODE" && *v == "1"));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| { *k == "OPENAI_COMPAT_BASE_URL" && *v == "http://127.0.0.1:11434/v1" }));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| *k == "OPENAI_COMPAT_MODEL" && *v == "llama3.1:8b"));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| *k == "OPENAI_COMPAT_API_KEY" && *v == "ollama-local-only"));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .all(|(k, _)| *k != "CODEX_CONFIG"
+                && *k != "CODEX_API_KEY"
+                && *k != "BUZZ_AGENT_MODEL"));
     }
 
     fn make_rule(
