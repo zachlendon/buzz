@@ -20,6 +20,13 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Conservative byte ceiling for collected final assistant chat text.
+///
+/// Capture is always-on (cheap when empty) so default-off paths cannot OOM on
+/// unbounded streaming. Overflow is tracked explicitly and is never published
+/// as a valid final answer — opt-in EndTurn with overflow is a generation error.
+pub(crate) const ASSISTANT_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -173,6 +180,31 @@ pub enum AcpError {
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
+
+    /// Application-class failure during assistant text generation / publish
+    /// gating (empty, overflow, non-EndTurn, Race-1). Does **not** indicate
+    /// ACP pipe corruption — the agent process is healthy and must be returned
+    /// to the pool (not respawned). Callers requeue the batch in Queue mode.
+    #[error("assistant generation failed: {0}")]
+    Generation(String),
+
+    /// Application-class failure delivering a signed assistant reply to the
+    /// relay. Does **not** indicate ACP pipe corruption — no respawn. Callers
+    /// must **not** requeue/rerun the model (the answer already exists; the
+    /// signed event may already be accepted with a delayed ACK).
+    #[error("relay delivery failed: {0}")]
+    Delivery(String),
+}
+
+/// Drained assistant-message buffer from one prompt attempt.
+///
+/// Produced by [`AcpClient::take_assistant_message`]. `overflow` means the
+/// bounded capture hit [`ASSISTANT_MESSAGE_MAX_BYTES`] and the text must not
+/// be published as a final answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenAssistantMessage {
+    pub text: String,
+    pub overflow: bool,
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -269,6 +301,17 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Concatenated `agent_message_chunk` text for the current prompt attempt.
+    /// Cleared at the start of each `session_prompt_blocks_with_idle_timeout`.
+    /// Taken on terminal completion when `publish_assistant_messages` is
+    /// enabled (Personal Delegate path). Always bounded by
+    /// [`ASSISTANT_MESSAGE_MAX_BYTES`] so default-off cannot OOM.
+    /// Thoughts, tool payloads, and observer frames are never collected here.
+    assistant_message: String,
+    /// Set when an `agent_message_chunk` would exceed
+    /// [`ASSISTANT_MESSAGE_MAX_BYTES`]. Cleared with the buffer at prompt start
+    /// and on [`take_assistant_message`]. Overflow text is never published.
+    assistant_message_overflow: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -591,6 +634,8 @@ impl AcpClient {
             active_run_id: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            assistant_message: String::new(),
+            assistant_message_overflow: false,
         })
     }
 
@@ -775,6 +820,11 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        // Fresh buffer for this prompt attempt so partial text / overflow from
+        // a prior cancel/timeout never leaks into a later publish decision.
+        self.assistant_message.clear();
+        self.assistant_message_overflow = false;
+
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -877,6 +927,47 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Drain the concatenated `agent_message_chunk` text and overflow flag
+    /// collected for the current prompt attempt. Subsequent calls return empty
+    /// non-overflow until more chunks arrive (or the next prompt clears).
+    ///
+    /// Intended for the opt-in `publish_assistant_messages` path in `pool.rs`.
+    /// Callers must never publish when `overflow` is true — truncated capture
+    /// is not a valid final answer.
+    pub fn take_assistant_message(&mut self) -> TakenAssistantMessage {
+        TakenAssistantMessage {
+            text: std::mem::take(&mut self.assistant_message),
+            overflow: std::mem::take(&mut self.assistant_message_overflow),
+        }
+    }
+
+    /// Append one `agent_message_chunk` into the bounded capture buffer.
+    ///
+    /// Never splits mid-codepoint. When a chunk would exceed
+    /// [`ASSISTANT_MESSAGE_MAX_BYTES`], appends only the whole UTF-8 prefix
+    /// that fits (if any) and sets the overflow flag. Further chunks are
+    /// ignored once overflowed so the buffer cannot grow without bound.
+    fn append_assistant_message_chunk(&mut self, text: &str) {
+        if self.assistant_message_overflow {
+            return;
+        }
+        let remaining = ASSISTANT_MESSAGE_MAX_BYTES.saturating_sub(self.assistant_message.len());
+        if text.len() <= remaining {
+            self.assistant_message.push_str(text);
+            return;
+        }
+        // Cap exceeded: keep a UTF-8-safe prefix that fits, mark overflow.
+        // Never publish this buffer as a final answer when overflow is set.
+        let mut end = remaining.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > 0 {
+            self.assistant_message.push_str(&text[..end]);
+        }
+        self.assistant_message_overflow = true;
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1630,6 +1721,11 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    // Collect for opt-in channel publish (Personal Delegate).
+                    // Always bounded (ASSISTANT_MESSAGE_MAX_BYTES) so default-off
+                    // cannot OOM. Order-preserving append of model text only —
+                    // not thoughts, tool payloads, or keepalives.
+                    self.append_assistant_message_chunk(text);
                 }
                 false
             }
@@ -3709,6 +3805,162 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
                 "update": update
             }
         })
+    }
+
+    /// Build a `session/update` carrying an `agent_message_chunk` (or thought).
+    fn agent_chunk_update_msg(session_update: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": {
+                    "sessionUpdate": session_update,
+                    "content": { "type": "text", "text": text },
+                },
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn publish_assistant_collects_message_chunks_ordered_excludes_thoughts() {
+        let mut client = spawn_inert_client().await;
+        let empty = client.take_assistant_message();
+        assert!(empty.text.is_empty(), "buffer starts empty");
+        assert!(!empty.overflow, "overflow starts false");
+
+        let _ =
+            client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", "Hello "));
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_thought_chunk",
+            "I am thinking…",
+        ));
+        let _ =
+            client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", "world"));
+
+        let taken = client.take_assistant_message();
+        assert_eq!(taken.text, "Hello world");
+        assert!(!taken.overflow);
+        // Thoughts must never land in the publish buffer.
+        assert!(!client.assistant_message.contains("thinking"));
+    }
+
+    #[tokio::test]
+    async fn publish_assistant_take_drains_once_and_prompt_start_clears() {
+        let mut client = spawn_inert_client().await;
+        let _ =
+            client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", "first"));
+        let first = client.take_assistant_message();
+        assert_eq!(first.text, "first");
+        assert!(!first.overflow);
+        let second = client.take_assistant_message();
+        assert!(second.text.is_empty(), "second take must drain to empty");
+        assert!(!second.overflow);
+
+        // Simulate a prior partial collection, then a new prompt attempt.
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "stale partial",
+        ));
+        // session_prompt_blocks_with_idle_timeout clears at start; mirror that
+        // clear here (writing to cat will fail at the await, but we only need
+        // the pre-write clear). Drive the clear directly.
+        client.assistant_message.clear();
+        client.assistant_message_overflow = false;
+        let cleared = client.take_assistant_message();
+        assert!(
+            cleared.text.is_empty(),
+            "prompt-start clear must discard partial text"
+        );
+        assert!(!cleared.overflow);
+    }
+
+    #[tokio::test]
+    async fn assistant_message_below_cap_no_overflow() {
+        let mut client = spawn_inert_client().await;
+        let text = "a".repeat(ASSISTANT_MESSAGE_MAX_BYTES - 1);
+        let _ = client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", &text));
+        let taken = client.take_assistant_message();
+        assert_eq!(taken.text.len(), ASSISTANT_MESSAGE_MAX_BYTES - 1);
+        assert!(!taken.overflow, "below cap must not overflow");
+    }
+
+    #[tokio::test]
+    async fn assistant_message_at_cap_no_overflow() {
+        let mut client = spawn_inert_client().await;
+        let text = "b".repeat(ASSISTANT_MESSAGE_MAX_BYTES);
+        let _ = client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", &text));
+        let taken = client.take_assistant_message();
+        assert_eq!(taken.text.len(), ASSISTANT_MESSAGE_MAX_BYTES);
+        assert!(!taken.overflow, "exact cap is allowed without overflow");
+    }
+
+    #[tokio::test]
+    async fn assistant_message_over_cap_sets_overflow_and_bounds_buffer() {
+        let mut client = spawn_inert_client().await;
+        let text = "c".repeat(ASSISTANT_MESSAGE_MAX_BYTES + 64);
+        let _ = client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", &text));
+        // Further chunks after overflow must not grow the buffer.
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "more after overflow",
+        ));
+        let taken = client.take_assistant_message();
+        assert!(taken.overflow, "over cap must set overflow");
+        assert!(
+            taken.text.len() <= ASSISTANT_MESSAGE_MAX_BYTES,
+            "buffer must stay within cap (got {})",
+            taken.text.len()
+        );
+        assert!(
+            taken.text.is_char_boundary(taken.text.len()),
+            "buffer must remain valid UTF-8"
+        );
+        // take drains overflow too
+        let again = client.take_assistant_message();
+        assert!(!again.overflow);
+        assert!(again.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assistant_message_multibyte_utf8_never_splits_codepoint() {
+        let mut client = spawn_inert_client().await;
+        // Fill to one byte short of the cap with ASCII, then append a 3-byte
+        // UTF-8 char (❤ = U+2764, e2 9d a4) that cannot fit whole.
+        let prefix = "x".repeat(ASSISTANT_MESSAGE_MAX_BYTES - 1);
+        let _ =
+            client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", &prefix));
+        let _ = client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", "❤"));
+        let taken = client.take_assistant_message();
+        assert!(taken.overflow, "multibyte that won't fit must overflow");
+        assert_eq!(
+            taken.text.len(),
+            ASSISTANT_MESSAGE_MAX_BYTES - 1,
+            "must not append a partial codepoint"
+        );
+        assert!(
+            taken.text.is_char_boundary(taken.text.len()),
+            "must remain valid UTF-8"
+        );
+        assert!(
+            !taken.text.contains('\u{FFFD}'),
+            "must not contain replacement chars from a mid-codepoint split"
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_message_multibyte_prefix_fits_when_room() {
+        let mut client = spawn_inert_client().await;
+        // Cap has room for exactly two bytes of a 3-byte char? No — whole-char
+        // only. Room for 3 bytes: fill to cap-3, append one 3-byte char → fits.
+        let prefix = "y".repeat(ASSISTANT_MESSAGE_MAX_BYTES - 3);
+        let _ =
+            client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", &prefix));
+        let _ = client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", "❤"));
+        let taken = client.take_assistant_message();
+        assert!(!taken.overflow);
+        assert_eq!(taken.text.len(), ASSISTANT_MESSAGE_MAX_BYTES);
+        assert!(taken.text.ends_with('❤'));
     }
 
     #[tokio::test]

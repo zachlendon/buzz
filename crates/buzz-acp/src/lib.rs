@@ -1566,6 +1566,7 @@ async fn tokio_main() -> Result<()> {
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
+        publish_assistant_messages: config.publish_assistant_messages,
     });
 
     if !config.memory_enabled {
@@ -4529,6 +4530,7 @@ mod build_mcp_servers_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            publish_assistant_messages: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -4724,6 +4726,7 @@ mod error_outcome_emission_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            publish_assistant_messages: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

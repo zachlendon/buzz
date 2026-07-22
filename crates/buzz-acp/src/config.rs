@@ -617,6 +617,19 @@ pub struct CliArgs {
     /// Publish encrypted ACP observer frames over the relay.
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
     pub relay_observer: bool,
+
+    /// When set, publish ACP `agent_message_chunk` text into the source channel
+    /// on **EndTurn only** (non-empty, bounded, no overflow). Cancelled and
+    /// other non-EndTurn stops requeue; delivery failure after sign does not
+    /// re-run the model. Intended for Personal Delegate / agents without a
+    /// channel-send tool. Off by default — ordinary agents post via CLI tools
+    /// and must not double-publish.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PUBLISH_ASSISTANT_MESSAGES",
+        default_value_t = false
+    )]
+    pub publish_assistant_messages: bool,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -698,6 +711,9 @@ pub struct Config {
     pub has_generated_codex_config: bool,
     /// Whether to publish encrypted observer frames through the relay.
     pub relay_observer: bool,
+    /// When true, publish collected ACP assistant text into the source channel
+    /// on EndTurn only (see `CliArgs::publish_assistant_messages`).
+    pub publish_assistant_messages: bool,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1219,6 +1235,7 @@ impl Config {
             persona_env_vars,
             has_generated_codex_config,
             relay_observer: args.relay_observer,
+            publish_assistant_messages: args.publish_assistant_messages,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1591,10 +1608,26 @@ mod tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            publish_assistant_messages: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
         }
+    }
+
+    #[test]
+    fn publish_assistant_messages_defaults_off() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(
+            !config.publish_assistant_messages,
+            "publish_assistant_messages must default to false"
+        );
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", &"0".repeat(64)])
+            .expect("minimal args parse");
+        assert!(
+            !args.publish_assistant_messages,
+            "CLI default for --publish-assistant-messages must be false"
+        );
     }
 
     #[test]

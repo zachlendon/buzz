@@ -106,6 +106,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_PERSONAL_DELEGATE_MCP_COMMAND` | no | unset | Absolute, supervisor-pinned executable for the Personal Delegate MCP. It receives neither `BUZZ_PRIVATE_KEY` nor `BUZZ_AUTH_TAG`. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_PUBLISH_ASSISTANT_MESSAGES` | no | `false` | When set, publish collected ACP `agent_message_chunk` text into the source channel on **EndTurn only** (non-empty, ≤64 KiB, no overflow). Cancelled / max_tokens / refusal / overflow / empty requeue the batch. Delivery failure after sign posts a notice and does **not** re-run the model. Off by default. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.

@@ -473,6 +473,9 @@ pub struct PromptContext {
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
+    /// When true, publish collected ACP assistant text into the source channel
+    /// on EndTurn only. See `Config::publish_assistant_messages`.
+    pub publish_assistant_messages: bool,
 }
 
 impl AgentPool {
@@ -1289,7 +1292,18 @@ pub async fn run_prompt_task(
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
+    // Create the guard first so any exit after this point cleans up. Then
+    // **await** establishment (bounded by REACTION_TIMEOUT per add) so the
+    // cleanup spawn on drop cannot complete before the adds finish.
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+
+    // Establish both 👀 and 💬 at task start so session setup / core fetch /
+    // canvas are covered, and so requeue/redispatch re-adds 👀 after a prior
+    // ReactionGuard cleared them. Awaited (not fire-and-forget) to avoid the
+    // guard-drop vs add race. Queue-push 👀 from main.rs remains F&F.
+    if should_establish_working_signals(&reaction_ids) {
+        establish_working_signals(&ctx.rest_client, &reaction_ids).await;
+    }
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -1745,16 +1759,8 @@ pub async fn run_prompt_task(
         return;
     };
 
-    // 💬 — fire-and-forget so the prompt fires immediately.
-    // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
-    // A brief race where 💬 appears slightly after the agent starts is acceptable.
-    if !reaction_ids.is_empty() {
-        let rest = ctx.rest_client.clone();
-        let ids = reaction_ids.clone();
-        tokio::spawn(async move {
-            react_working(&rest, &ids).await;
-        });
-    }
+    // Working reactions (👀 + 💬) were established at task start above so
+    // setup is covered. Do not re-add here — avoids a double 💬 publish.
 
     // Slash-command pass-through sends the bare command as the first text
     // block (so connector detection fires), then each prompt section as its
@@ -1910,6 +1916,74 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        // Race-1: prompt Ok was lost (select! dropped the future); only
+                        // `last_prompt_id = None` remains. Stop reason is
+                        // unknown — never invent EndTurn as publish-safe.
+                        //
+                        // Opt-in + channel: drain buffer, Error + requeue.
+                        // Default-off / heartbeat: NoOp + synthetic Ok(EndTurn)
+                        // (prior behaviour).
+                        if race1_opt_in_must_requeue(ctx.publish_assistant_messages, &source) {
+                            // Drain via the publish seam (None stop reason →
+                            // NonSuccessStopReason; never publishes).
+                            let fate = maybe_publish_assistant_on_success(
+                                &mut agent,
+                                &ctx,
+                                &source,
+                                batch.as_ref(),
+                                None, // stop reason unknown (race-1)
+                            )
+                            .await;
+                            let (publish_err, requeue) = match fate {
+                                AssistantPublishFate::GenerationFailure(e) => {
+                                    (e, requeue_batch_if_queue(&ctx, batch))
+                                }
+                                AssistantPublishFate::DeliveryFailure {
+                                    message,
+                                    channel_id,
+                                    thread_tags,
+                                    notice,
+                                } => {
+                                    // Unexpected on Race-1 (no publish), but
+                                    // honour delivery semantics if it happens.
+                                    post_failure_notice(
+                                        &ctx.rest_client,
+                                        channel_id,
+                                        &thread_tags,
+                                        &notice,
+                                    )
+                                    .await;
+                                    (AcpError::Delivery(message), None)
+                                }
+                                // Belt-and-suspenders: seam must fail when
+                                // race1_opt_in_must_requeue is true.
+                                AssistantPublishFate::Continue => (
+                                    AcpError::Generation(
+                                        "assistant turn ended with non-publishable stop reason: ambiguous_stop_reason".into(),
+                                    ),
+                                    requeue_batch_if_queue(&ctx, batch),
+                                ),
+                            };
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &turn_id,
+                                Some(buzz_core::agent_turn_metric::StopReason::Error),
+                            )
+                            .await;
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(publish_err),
+                                requeue,
+                            );
+                            return;
+                        }
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -1969,6 +2043,71 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+            }
+
+            // Opt-in: publish collected assistant text into the source channel
+            // only on EndTurn with non-empty non-overflow text.
+            // Cancelled / MaxTokens / MaxTurnRequests / Refusal / overflow /
+            // empty → GenerationFailure + requeue (Queue mode).
+            // Delivery failure after sign → notice + no requeue (no model re-run).
+            match maybe_publish_assistant_on_success(
+                &mut agent,
+                &ctx,
+                &source,
+                batch.as_ref(),
+                Some(&stop_reason),
+            )
+            .await
+            {
+                AssistantPublishFate::Continue => {}
+                AssistantPublishFate::GenerationFailure(publish_err) => {
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(publish_err),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
+                }
+                AssistantPublishFate::DeliveryFailure {
+                    message,
+                    channel_id,
+                    thread_tags,
+                    notice,
+                } => {
+                    post_failure_notice(&ctx.rest_client, channel_id, &thread_tags, &notice).await;
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(AcpError::Delivery(message)),
+                        None, // delivery error: do not requeue / re-run model
+                    );
+                    return;
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -3040,11 +3179,21 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
 //   👀  "seen"    — event was queued and an agent will handle it
 //   💬  "working" — agent is actively prompting
 //
-// 💬 is awaited inline in `run_prompt_task` before the prompt fires, so
-// add-before-remove ordering is structural. 👀 is fire-and-forget from
-// `main.rs` at queue-push time for immediate responsiveness; on rare
-// fast-failure paths the guard's cleanup may race with the 👀 add,
-// leaving a cosmetic stale 👀 (see `ReactionGuard` docs).
+// Both 👀 and 💬 are established at `run_prompt_task` start via an **awaited**
+// `establish_working_signals` (after `ReactionGuard` is created, before session
+// setup) so session setup is covered and requeue/redispatch re-adds 👀 after a
+// prior guard cleared them. Awaiting prevents guard-drop cleanup from racing
+// ahead of the task-start adds.
+// `main.rs` also adds 👀 at first `queue.push` acceptance for immediate
+// responsiveness (that path remains fire-and-forget).
+//
+// Double-add of 👀 (queue-accept + task-start) is intentional and safe:
+// buzz-db enforces one reaction per (user, emoji, event) — active duplicates
+// are no-ops (`add_reaction` returns false; `insert_reaction_event_with_thread_metadata`
+// returns before storing a duplicate kind:7). Soft-deleted reactions are
+// reactivated on re-add (needed after ReactionGuard cleanup on retry).
+// See `crates/buzz-db/src/reaction.rs` module docs and
+// `crates/buzz-db/src/event.rs` insert_reaction path.
 //
 // Cleanup is fire-and-forget via `ReactionGuard` (spawned on drop).
 // Failures are debug-logged and ignored — reactions are cosmetic.
@@ -3056,14 +3205,13 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
 ///
 /// ## Ordering
 ///
-/// 💬 (`react_working`) is fire-and-forget (spawned before the prompt fires).
-/// A brief race where 💬 appears slightly after the agent starts is acceptable.
+/// Task-start 👀 and 💬 are **awaited** via `establish_working_signals` after
+/// this guard is created and before session setup. That ordering guarantees
+/// cleanup cannot complete before the adds finish for the task-start path.
 ///
-/// 👀 (`react_seen`) is fire-and-forget from `main.rs` at queue-push time.
-/// On rare fast-failure paths (e.g., `session_new` error on an idle agent),
-/// the cleanup spawn may race with the 👀 add, leaving a stale 👀. This is
-/// accepted as a cosmetic edge case — the message will be retried and the
-/// stale 👀 is harmless.
+/// 👀 is also fire-and-forget from `main.rs` at queue-push time. That path
+/// can still race with cleanup on rare fast-failure exits — accepted as a
+/// cosmetic edge case (retry re-establishes; stale 👀 is harmless).
 struct ReactionGuard {
     rest: Option<crate::relay::RestClient>,
     ids: Vec<String>,
@@ -3488,6 +3636,448 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+// ── Assistant-message publish (Personal Delegate opt-in) ──────────────────
+
+/// Bounded retries when submitting the same signed assistant-message event.
+///
+/// Relay dedup by event id makes same-event retries safe. After exhaustion we
+/// surface a delivery failure (visible notice, no model re-run / no requeue).
+pub(crate) const ASSISTANT_PUBLISH_MAX_ATTEMPTS: u32 = 3;
+
+/// Per-attempt timeout for assistant-message relay submission.
+const ASSISTANT_PUBLISH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Short backoff between assistant-message submit retries.
+const ASSISTANT_PUBLISH_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Whether a successful turn should publish collected assistant text.
+///
+/// Requires the opt-in flag **and** a channel source (never heartbeats).
+pub(crate) fn should_publish_assistant(publish_enabled: bool, source: &PromptSource) -> bool {
+    publish_enabled && matches!(source, PromptSource::Channel(_))
+}
+
+/// Trim and reject empty/whitespace-only assistant text.
+pub(crate) fn publishable_assistant_text(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Decision produced by the pure publish-outcome helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PublishDecision {
+    /// Flag off or heartbeat — outer path keeps the real `Ok(stop_reason)`.
+    NoOp,
+    /// Flag on, channel source, EndTurn, non-empty non-overflow text — publish.
+    Publish(String),
+    /// Flag on, channel source, EndTurn, empty/whitespace text — must not silent-succeed.
+    EmptyFailure,
+    /// Flag on, channel source, EndTurn, capture overflowed the byte ceiling.
+    /// Never publish truncated text; requeue as generation failure.
+    OverflowFailure,
+    /// Flag on, channel source, non-EndTurn terminal (or Race-1 unknown).
+    /// Caller must return `PromptOutcome::Error` + requeue — never publish.
+    /// Values: `"cancelled"` | `"max_tokens"` | `"max_turn_requests"` |
+    /// `"refusal"` | `"ambiguous_stop_reason"`.
+    NonSuccessStopReason(&'static str),
+}
+
+/// Pure stop-reason gate for the opt-in publish path (no text inspection).
+///
+/// `stop_reason: None` means Race-1 / stop reason unknown (prompt Ok lost).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OptInTerminalAction {
+    /// Flag off or heartbeat — default-off path unchanged.
+    NoOp,
+    /// Only `EndTurn` may attempt publish (text/overflow checked separately).
+    MayPublish,
+    /// Non-success terminal (including natural Cancelled), overflow handled
+    /// separately, or ambiguous Race-1 — Error + requeue when opt-in.
+    NonSuccess(&'static str),
+}
+
+/// Pure gate: what the opt-in path should do for a given stop reason.
+///
+/// `stop_reason: None` means Race-1 / stop reason unknown (prompt Ok lost).
+/// Under opt-in + channel, **only** `EndTurn` may publish; every other stop
+/// reason (including natural `Cancelled`) is a non-success requeue decision.
+pub(crate) fn opt_in_terminal_action(
+    publish_enabled: bool,
+    source: &PromptSource,
+    stop_reason: Option<&StopReason>,
+) -> OptInTerminalAction {
+    if !should_publish_assistant(publish_enabled, source) {
+        return OptInTerminalAction::NoOp;
+    }
+    match stop_reason {
+        Some(StopReason::EndTurn) => OptInTerminalAction::MayPublish,
+        Some(StopReason::Cancelled) => OptInTerminalAction::NonSuccess("cancelled"),
+        Some(StopReason::MaxTokens) => OptInTerminalAction::NonSuccess("max_tokens"),
+        Some(StopReason::MaxTurnRequests) => OptInTerminalAction::NonSuccess("max_turn_requests"),
+        Some(StopReason::Refusal) => OptInTerminalAction::NonSuccess("refusal"),
+        None => OptInTerminalAction::NonSuccess("ambiguous_stop_reason"),
+    }
+}
+
+/// Race-1 with opt-in + channel must fail/requeue (stop reason unknown).
+///
+/// When false (default-off or heartbeat), Race-1 keeps prior `Ok(EndTurn)`.
+pub(crate) fn race1_opt_in_must_requeue(publish_enabled: bool, source: &PromptSource) -> bool {
+    should_publish_assistant(publish_enabled, source)
+}
+
+/// Pure decision for whether/what to publish after a terminal turn.
+///
+/// `stop_reason: None` means Race-1 / stop reason unknown (prompt Ok lost).
+/// `text` is the raw drained assistant buffer (may be empty).
+/// `overflow` means the bounded capture hit its ceiling — never publish.
+///
+/// Only `Some(EndTurn)` with non-empty non-overflow text yields `Publish`.
+/// Cancelled / MaxTokens / MaxTurnRequests / Refusal / Race-1 (`None`) yield
+/// `NonSuccessStopReason` when opt-in is on (requeue; never silent consume).
+pub(crate) fn finalize_publish_outcome(
+    publish_enabled: bool,
+    source: &PromptSource,
+    stop_reason: Option<&StopReason>,
+    text: &str,
+    overflow: bool,
+) -> PublishDecision {
+    match opt_in_terminal_action(publish_enabled, source, stop_reason) {
+        OptInTerminalAction::NoOp => PublishDecision::NoOp,
+        OptInTerminalAction::NonSuccess(reason) => PublishDecision::NonSuccessStopReason(reason),
+        OptInTerminalAction::MayPublish => {
+            if overflow {
+                PublishDecision::OverflowFailure
+            } else {
+                match publishable_assistant_text(text) {
+                    Some(content) => PublishDecision::Publish(content.to_string()),
+                    None => PublishDecision::EmptyFailure,
+                }
+            }
+        }
+    }
+}
+
+/// Structured result of the opt-in assistant publish seam.
+///
+/// Distinguishes generation failures (requeue, no respawn) from delivery
+/// failures (no requeue / no model re-run, no respawn, visible notice).
+#[derive(Debug)]
+pub(crate) enum AssistantPublishFate {
+    /// Default-off, heartbeat, or successful EndTurn publish — continue.
+    Continue,
+    /// Empty / overflow / non-EndTurn / Race-1 — requeue batch, return agent.
+    GenerationFailure(AcpError),
+    /// Signed event could not be confirmed delivered — no requeue, notice.
+    DeliveryFailure {
+        message: String,
+        channel_id: Uuid,
+        thread_tags: ThreadTags,
+        notice: String,
+    },
+}
+
+/// Metadata for an assistant reply into the accepted batch's source channel.
+///
+/// Always targets `batch.channel_id` only — never any other channel.
+#[derive(Debug, Clone)]
+pub(crate) struct AssistantReplyMeta {
+    pub channel_id: Uuid,
+    pub thread_tags: ThreadTags,
+    /// Author of the last/triggering batch event (p-tag target).
+    pub asker_pubkey: Option<String>,
+}
+
+/// Derive reply metadata from the accepted batch. Source channel only.
+pub(crate) fn assistant_reply_meta(batch: &FlushBatch) -> AssistantReplyMeta {
+    let last = batch.events.last();
+    let thread_tags = last
+        .map(|be| crate::queue::parse_thread_tags(&be.event))
+        .unwrap_or_default();
+    let asker_pubkey = last.map(|be| be.event.pubkey.to_hex());
+    AssistantReplyMeta {
+        channel_id: batch.channel_id,
+        thread_tags,
+        asker_pubkey,
+    }
+}
+
+/// Build+sign a kind:9 assistant reply for the given channel.
+///
+/// Extracted for unit testing that the event targets exactly `channel_id`.
+/// Build/sign failures are delivery-class (`AcpError::Delivery`) — not ACP
+/// pipe corruption — so they must not trigger subprocess respawn.
+pub(crate) fn build_assistant_message_event(
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    asker_pubkey: Option<&str>,
+) -> Result<nostr::Event, AcpError> {
+    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
+        let root_id = nostr::EventId::from_hex(root).ok()?;
+        let parent_id = thread_tags
+            .parent_event_id
+            .as_deref()
+            .and_then(|p| nostr::EventId::from_hex(p).ok())
+            .unwrap_or(root_id);
+        Some(buzz_sdk::ThreadRef {
+            root_event_id: root_id,
+            parent_event_id: parent_id,
+        })
+    });
+    let mentions: Vec<&str> = asker_pubkey.into_iter().collect();
+    let builder = buzz_sdk::build_message(
+        channel_id,
+        content,
+        thread_ref.as_ref(),
+        &mentions,
+        false,
+        &[],
+    )
+    .map_err(|e| AcpError::Delivery(format!("assistant message: build failed: {e}")))?;
+    builder
+        .sign_with_keys(keys)
+        .map_err(|e| AcpError::Delivery(format!("assistant message: sign failed: {e}")))
+}
+
+/// Submit a pre-signed event with bounded retries of the **same** event id.
+///
+/// The submit closure receives a **clone** of the signed event each attempt so
+/// async futures do not need to borrow across awaits. Event id is identical
+/// across clones (same signature) — relay dedup makes retries safe.
+///
+/// Production uses this with `rest.submit_event`; tests inject a fake closure
+/// to prove same-id retries and final delivery-failure fate without a relay.
+///
+/// Policy: [`ASSISTANT_PUBLISH_MAX_ATTEMPTS`] attempts (default 3) with a short
+/// backoff between failures.
+pub(crate) async fn submit_signed_event_with_retries<F, Fut>(
+    event: &nostr::Event,
+    max_attempts: u32,
+    mut submit: F,
+) -> Result<(), String>
+where
+    F: FnMut(nostr::Event) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let attempts = max_attempts.max(1);
+    let mut last_err = String::from("no attempts made");
+    for attempt in 1..=attempts {
+        // Clone preserves id/sig — one logical signed event, N submit attempts.
+        match submit(event.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    target: "pool::prompt",
+                    event_id = %event.id,
+                    attempt,
+                    max_attempts = attempts,
+                    error = %e,
+                    "assistant message submit attempt failed"
+                );
+                last_err = e;
+                if attempt < attempts {
+                    tokio::time::sleep(ASSISTANT_PUBLISH_RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Publish a kind:9 channel message with the agent's collected assistant text.
+///
+/// Builds and signs **one** event, then retries submission of that exact event
+/// (same id) under a bounded policy. Relay dedup makes same-event retries safe.
+///
+/// On final failure returns [`AcpError::Delivery`] — callers must **not**
+/// requeue/rerun the model (the answer already exists; a delayed ACK may have
+/// accepted the event). Does not use [`AcpError::Protocol`] (would respawn).
+pub(crate) async fn publish_assistant_message(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    asker_pubkey: Option<&str>,
+) -> Result<(), AcpError> {
+    let event =
+        build_assistant_message_event(&rest.keys, channel_id, thread_tags, content, asker_pubkey)?;
+    let event_id = event.id;
+    let rest = rest.clone();
+    submit_signed_event_with_retries(&event, ASSISTANT_PUBLISH_MAX_ATTEMPTS, move |ev| {
+        let rest = rest.clone();
+        async move {
+            match tokio::time::timeout(ASSISTANT_PUBLISH_ATTEMPT_TIMEOUT, rest.submit_event(&ev))
+                .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(format!("assistant message publish failed: {e}")),
+                Err(_) => Err("assistant message publish timed out".into()),
+            }
+        }
+    })
+    .await
+    .map_err(|e| {
+        AcpError::Delivery(format!(
+            "assistant message delivery failed after {ASSISTANT_PUBLISH_MAX_ATTEMPTS} attempts \
+             (event_id={event_id}): {e}"
+        ))
+    })
+}
+
+/// On terminal completion: optionally publish the drained assistant buffer.
+///
+/// `stop_reason: None` means Race-1 / stop reason unknown (prompt Ok lost).
+///
+/// Returns:
+/// - [`AssistantPublishFate::Continue`] — default-off / success
+/// - [`AssistantPublishFate::GenerationFailure`] — requeue (empty, overflow,
+///   non-EndTurn including Cancelled, Race-1); application-class, no respawn
+/// - [`AssistantPublishFate::DeliveryFailure`] — no requeue; post notice
+///
+/// Always drains the assistant buffer when opt-in + channel so partial text
+/// cannot leak to a later turn (including Cancelled / non-success paths).
+async fn maybe_publish_assistant_on_success(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    source: &PromptSource,
+    batch: Option<&FlushBatch>,
+    stop_reason: Option<&StopReason>,
+) -> AssistantPublishFate {
+    if !should_publish_assistant(ctx.publish_assistant_messages, source) {
+        return AssistantPublishFate::Continue;
+    }
+    // Drain before deciding so Cancelled / MaxTokens / Race-1 cannot leave
+    // partial text for a subsequent turn to publish.
+    let taken = agent.acp.take_assistant_message();
+    match finalize_publish_outcome(
+        ctx.publish_assistant_messages,
+        source,
+        stop_reason,
+        &taken.text,
+        taken.overflow,
+    ) {
+        PublishDecision::NoOp => AssistantPublishFate::Continue,
+        PublishDecision::EmptyFailure => {
+            tracing::warn!(
+                target: "pool::prompt",
+                "publish_assistant_messages enabled but assistant produced no publishable text"
+            );
+            AssistantPublishFate::GenerationFailure(AcpError::Generation(
+                "assistant produced no publishable text".into(),
+            ))
+        }
+        PublishDecision::OverflowFailure => {
+            tracing::warn!(
+                target: "pool::prompt",
+                cap = crate::acp::ASSISTANT_MESSAGE_MAX_BYTES,
+                "publish_assistant_messages: assistant capture overflowed; not publishing truncated text"
+            );
+            AssistantPublishFate::GenerationFailure(AcpError::Generation(format!(
+                "assistant message exceeded {} byte capture ceiling",
+                crate::acp::ASSISTANT_MESSAGE_MAX_BYTES
+            )))
+        }
+        PublishDecision::NonSuccessStopReason(reason) => {
+            tracing::warn!(
+                target: "pool::prompt",
+                stop_reason = reason,
+                "publish_assistant_messages: non-publishable terminal stop reason"
+            );
+            AssistantPublishFate::GenerationFailure(AcpError::Generation(format!(
+                "assistant turn ended with non-publishable stop reason: {reason}"
+            )))
+        }
+        PublishDecision::Publish(content) => {
+            let Some(batch) = batch else {
+                // should_publish requires Channel source, which implies batch.
+                return AssistantPublishFate::GenerationFailure(AcpError::Generation(
+                    "assistant publish: channel source missing batch".into(),
+                ));
+            };
+            let meta = assistant_reply_meta(batch);
+            tracing::info!(
+                target: "pool::prompt",
+                channel = %meta.channel_id,
+                chars = content.len(),
+                "publishing assistant message to source channel"
+            );
+            match publish_assistant_message(
+                &ctx.rest_client,
+                meta.channel_id,
+                &meta.thread_tags,
+                &content,
+                meta.asker_pubkey.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => AssistantPublishFate::Continue,
+                Err(e) => {
+                    let message = e.to_string();
+                    let notice = format!(
+                        "⚠️ Failed to deliver assistant reply to the channel \
+                         (the answer was generated but could not be confirmed published). \
+                         It will not be retried automatically. Details: {message}"
+                    );
+                    AssistantPublishFate::DeliveryFailure {
+                        message,
+                        channel_id: meta.channel_id,
+                        thread_tags: meta.thread_tags,
+                        notice,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Pure orchestration helper for tests: map a publish decision + optional
+/// delivery result into an [`AssistantPublishFate`] without touching an agent.
+///
+/// `delivery_result` is only consulted for [`PublishDecision::Publish`].
+/// `meta` supplies channel/thread for delivery-failure notices.
+#[cfg(test)]
+pub(crate) fn fate_from_decision_and_delivery(
+    decision: PublishDecision,
+    meta: Option<&AssistantReplyMeta>,
+    delivery_result: Option<Result<(), String>>,
+) -> AssistantPublishFate {
+    match decision {
+        PublishDecision::NoOp => AssistantPublishFate::Continue,
+        PublishDecision::EmptyFailure => AssistantPublishFate::GenerationFailure(
+            AcpError::Generation("assistant produced no publishable text".into()),
+        ),
+        PublishDecision::OverflowFailure => AssistantPublishFate::GenerationFailure(
+            AcpError::Generation("assistant message exceeded capture ceiling".into()),
+        ),
+        PublishDecision::NonSuccessStopReason(reason) => {
+            AssistantPublishFate::GenerationFailure(AcpError::Generation(format!(
+                "assistant turn ended with non-publishable stop reason: {reason}"
+            )))
+        }
+        PublishDecision::Publish(_) => match delivery_result {
+            Some(Ok(())) => AssistantPublishFate::Continue,
+            Some(Err(e)) => {
+                let meta = meta.expect("publish path requires reply meta");
+                AssistantPublishFate::DeliveryFailure {
+                    message: e.clone(),
+                    channel_id: meta.channel_id,
+                    thread_tags: meta.thread_tags.clone(),
+                    notice: format!("delivery failed: {e}"),
+                }
+            }
+            None => AssistantPublishFate::GenerationFailure(AcpError::Generation(
+                "publish decision without delivery attempt".into(),
+            )),
+        },
+    }
+}
+
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
@@ -3573,16 +4163,51 @@ pub(crate) async fn reaction_remove(rest: &crate::relay::RestClient, event_id: &
 /// Prevents unbounded parallelism when a large batch of events arrives.
 const REACTION_CONCURRENCY: usize = 10;
 
-/// Add 💬 to all events, capped at `REACTION_CONCURRENCY` concurrent requests.
-/// Awaited inline before the prompt fires.
-async fn react_working(rest: &crate::relay::RestClient, event_ids: &[String]) {
+/// Emojis re-established at every `run_prompt_task` start.
+///
+/// Includes 👀 (SEEN) so task-start re-establishes after `ReactionGuard` clear
+/// on requeue/retry, plus 💬 (WORKING) for active-prompt visibility.
+///
+/// Safe to re-add while already active: the relay/DB dedups one reaction per
+/// (pubkey, emoji, target). Queue-accept 👀 + task-start 👀 does not inflate
+/// UI counts — `add_reaction` returns false for active duplicates and
+/// `insert_reaction_event_with_thread_metadata` never stores a duplicate
+/// kind:7 (`crates/buzz-db/src/reaction.rs`, `crates/buzz-db/src/event.rs`).
+/// Soft-deleted reactions are correctly reactivated for retries.
+///
+/// Keep both queue-accept 👀 and task-start 👀+💬 (immediate ack + retry
+/// visibility). No client-side query-before-add is required.
+pub(crate) fn working_signal_emojis() -> &'static [&'static str] {
+    &[REACTION_SEEN, REACTION_WORKING]
+}
+
+/// Whether a prompt-task dispatch should establish working reactions.
+/// Non-empty reaction id list (i.e. a channel batch with events).
+pub(crate) fn should_establish_working_signals(reaction_ids: &[String]) -> bool {
+    !reaction_ids.is_empty()
+}
+
+/// Add both 👀 and 💬 to all events at task start.
+///
+/// **Awaited** from `run_prompt_task` after `ReactionGuard` is created and
+/// before session setup, so guard-drop cleanup cannot race ahead of the adds.
+/// Requeue/redispatch re-adds 👀 after a prior `ReactionGuard` cleared them
+/// (DB dedup / soft-delete reactivation makes re-add safe).
+/// Capped at `REACTION_CONCURRENCY` concurrent request pairs; each add uses
+/// `REACTION_TIMEOUT`.
+async fn establish_working_signals(rest: &crate::relay::RestClient, event_ids: &[String]) {
+    let emojis = working_signal_emojis();
     for chunk in event_ids.chunks(REACTION_CONCURRENCY) {
-        futures_util::future::join_all(
-            chunk
-                .iter()
-                .map(|eid| reaction_add(rest, eid, REACTION_WORKING)),
-        )
-        .await;
+        let futures: Vec<_> = chunk
+            .iter()
+            .flat_map(|eid| {
+                emojis
+                    .iter()
+                    .copied()
+                    .map(|emoji| reaction_add(rest, eid, emoji))
+            })
+            .collect();
+        futures_util::future::join_all(futures).await;
     }
 }
 
@@ -5256,6 +5881,7 @@ mod tests {
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,
             harness_name: "goose".to_string(),
+            publish_assistant_messages: false,
         }
     }
 
@@ -5565,5 +6191,447 @@ mod tests {
             !section.contains("+00:00"),
             "timestamp must not use +00:00 offset"
         );
+    }
+
+    // ── publish_assistant_messages helpers ───────────────────────────────────
+
+    #[test]
+    fn publish_assistant_defaults_off_in_prompt_context() {
+        let ctx = make_prompt_context_no_owner();
+        assert!(
+            !ctx.publish_assistant_messages,
+            "PromptContext must default publish_assistant_messages to false"
+        );
+    }
+
+    #[test]
+    fn should_publish_assistant_only_when_enabled_and_channel() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let heartbeat = PromptSource::Heartbeat;
+        assert!(!should_publish_assistant(false, &channel));
+        assert!(!should_publish_assistant(false, &heartbeat));
+        assert!(!should_publish_assistant(true, &heartbeat));
+        assert!(should_publish_assistant(true, &channel));
+    }
+
+    #[test]
+    fn publishable_assistant_text_rejects_empty_and_whitespace() {
+        assert_eq!(publishable_assistant_text(""), None);
+        assert_eq!(publishable_assistant_text("   \n\t  "), None);
+        assert_eq!(publishable_assistant_text(" hi "), Some("hi"));
+    }
+
+    #[test]
+    fn finalize_publish_outcome_empty_text_is_failure_when_enabled() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let end_turn = StopReason::EndTurn;
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&end_turn), "   ", false),
+            PublishDecision::EmptyFailure
+        );
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&end_turn), "answer", false),
+            PublishDecision::Publish("answer".into())
+        );
+        // Flag off: empty text is fine (agents use CLI tools).
+        assert_eq!(
+            finalize_publish_outcome(false, &channel, Some(&end_turn), "", false),
+            PublishDecision::NoOp
+        );
+        // Heartbeat never publishes.
+        assert_eq!(
+            finalize_publish_outcome(
+                true,
+                &PromptSource::Heartbeat,
+                Some(&end_turn),
+                "secret",
+                false
+            ),
+            PublishDecision::NoOp
+        );
+    }
+
+    #[test]
+    fn end_turn_with_text_publishes_when_enabled() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "hello", false),
+            PublishDecision::Publish("hello".into())
+        );
+        assert_eq!(
+            opt_in_terminal_action(true, &channel, Some(&StopReason::EndTurn)),
+            OptInTerminalAction::MayPublish
+        );
+    }
+
+    #[test]
+    fn end_turn_overflow_is_failure_never_publish() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        assert_eq!(
+            finalize_publish_outcome(
+                true,
+                &channel,
+                Some(&StopReason::EndTurn),
+                "truncated but long",
+                true
+            ),
+            PublishDecision::OverflowFailure
+        );
+        // Default-off still NoOp even with overflow flag.
+        assert_eq!(
+            finalize_publish_outcome(
+                false,
+                &channel,
+                Some(&StopReason::EndTurn),
+                "truncated",
+                true
+            ),
+            PublishDecision::NoOp
+        );
+    }
+
+    #[test]
+    fn cancelled_is_non_success_requeue_under_opt_in() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        // Natural Ok(Cancelled) must not silently consume the batch under opt-in.
+        assert_eq!(
+            finalize_publish_outcome(
+                true,
+                &channel,
+                Some(&StopReason::Cancelled),
+                "partial answer",
+                false
+            ),
+            PublishDecision::NonSuccessStopReason("cancelled")
+        );
+        assert_eq!(
+            opt_in_terminal_action(true, &channel, Some(&StopReason::Cancelled)),
+            OptInTerminalAction::NonSuccess("cancelled")
+        );
+    }
+
+    #[test]
+    fn max_tokens_is_non_success_when_enabled() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        assert_eq!(
+            finalize_publish_outcome(
+                true,
+                &channel,
+                Some(&StopReason::MaxTokens),
+                "truncated",
+                false
+            ),
+            PublishDecision::NonSuccessStopReason("max_tokens")
+        );
+        assert_eq!(
+            opt_in_terminal_action(true, &channel, Some(&StopReason::MaxTokens)),
+            OptInTerminalAction::NonSuccess("max_tokens")
+        );
+    }
+
+    #[test]
+    fn max_turn_requests_is_non_success_when_enabled() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        assert_eq!(
+            finalize_publish_outcome(
+                true,
+                &channel,
+                Some(&StopReason::MaxTurnRequests),
+                "partial",
+                false
+            ),
+            PublishDecision::NonSuccessStopReason("max_turn_requests")
+        );
+    }
+
+    #[test]
+    fn refusal_is_non_success_when_enabled() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&StopReason::Refusal), "nope", false),
+            PublishDecision::NonSuccessStopReason("refusal")
+        );
+    }
+
+    #[test]
+    fn race1_none_stop_reason_is_non_success_when_enabled() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        // Race-1: prompt Ok lost; stop reason unknown — never publish.
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, None, "maybe complete", false),
+            PublishDecision::NonSuccessStopReason("ambiguous_stop_reason")
+        );
+        assert_eq!(
+            opt_in_terminal_action(true, &channel, None),
+            OptInTerminalAction::NonSuccess("ambiguous_stop_reason")
+        );
+        assert!(race1_opt_in_must_requeue(true, &channel));
+        assert!(!race1_opt_in_must_requeue(false, &channel));
+        assert!(!race1_opt_in_must_requeue(true, &PromptSource::Heartbeat));
+    }
+
+    #[test]
+    fn default_off_noop_for_all_stop_reasons_including_race1() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let reasons: [Option<&StopReason>; 4] = [
+            Some(&StopReason::EndTurn),
+            Some(&StopReason::Cancelled),
+            Some(&StopReason::MaxTokens),
+            None, // race-1
+        ];
+        for stop in reasons {
+            assert_eq!(
+                finalize_publish_outcome(false, &channel, stop, "text", false),
+                PublishDecision::NoOp,
+                "default-off must NoOp for stop_reason={stop:?}"
+            );
+            assert_eq!(
+                opt_in_terminal_action(false, &channel, stop),
+                OptInTerminalAction::NoOp,
+                "default-off terminal action must NoOp for stop_reason={stop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_reply_meta_uses_batch_channel_only() {
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let meta = assistant_reply_meta(&batch);
+        assert_eq!(meta.channel_id, channel_id);
+        assert_eq!(
+            meta.channel_id, batch.channel_id,
+            "publish must target exactly the accepted batch source channel"
+        );
+        assert!(
+            meta.asker_pubkey.is_some(),
+            "asker p-tag should come from last batch event"
+        );
+    }
+
+    #[test]
+    fn build_assistant_message_event_targets_source_channel() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let other_channel = Uuid::new_v4();
+        let tags = ThreadTags::default();
+        let event =
+            build_assistant_message_event(&keys, channel_id, &tags, "hello from agent", None)
+                .expect("build+sign");
+        assert_eq!(event.kind, Kind::Custom(9));
+        assert_eq!(event.content, "hello from agent");
+        let channel_str = channel_id.to_string();
+        let other_str = other_channel.to_string();
+        let h_tags: Vec<&str> = event
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let parts = t.as_slice();
+                if parts.first().map(|s| s.as_str()) == Some("h") {
+                    parts.get(1).map(|s| s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(h_tags, vec![channel_str.as_str()]);
+        assert!(
+            !h_tags.iter().any(|h| *h == other_str.as_str()),
+            "must never target a non-source channel"
+        );
+    }
+
+    /// EndTurn + text → one logical event build; one successful submit.
+    #[tokio::test]
+    async fn publish_assistant_end_turn_one_build_one_submit() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let tags = ThreadTags::default();
+        let event = build_assistant_message_event(&keys, channel_id, &tags, "final answer", None)
+            .expect("one build+sign");
+        let event_id = event.id;
+        let submits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<nostr::EventId>::new()));
+        let submits_c = submits.clone();
+        let result = submit_signed_event_with_retries(&event, 3, move |ev| {
+            let submits_c = submits_c.clone();
+            async move {
+                submits_c.lock().unwrap().push(ev.id);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        let ids = submits.lock().unwrap().clone();
+        assert_eq!(ids, vec![event_id], "exactly one submit of the signed id");
+    }
+
+    /// Transient failure then success resubmits the exact same event id.
+    #[tokio::test]
+    async fn publish_assistant_retry_resubmits_same_event_id() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = build_assistant_message_event(
+            &keys,
+            channel_id,
+            &ThreadTags::default(),
+            "retry me",
+            None,
+        )
+        .expect("build");
+        let event_id = event.id;
+        let submits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let submits_c = submits.clone();
+        let seen_c = seen_ids.clone();
+        let result = submit_signed_event_with_retries(&event, 3, move |ev| {
+            let n = submits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let seen_c = seen_c.clone();
+            async move {
+                seen_c.lock().unwrap().push(ev.id);
+                if n < 2 {
+                    Err("transient".into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(submits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let ids = seen_ids.lock().unwrap().clone();
+        assert!(ids.iter().all(|id| *id == event_id));
+        assert_eq!(ids.len(), 2);
+    }
+
+    /// Final ambiguous failure is a delivery fate — not a model-requeue action.
+    #[tokio::test]
+    async fn publish_assistant_final_failure_is_delivery_not_requeue() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let meta = assistant_reply_meta(&batch);
+        let event =
+            build_assistant_message_event(&keys, channel_id, &meta.thread_tags, "answer", None)
+                .expect("build once");
+        let event_id = event.id;
+        let submits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let submits_c = submits.clone();
+        let submit_err = submit_signed_event_with_retries(&event, 3, move |ev| {
+            assert_eq!(ev.id, event_id, "retries must use the same signed event");
+            let submits_c = submits_c.clone();
+            async move {
+                submits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("timeout/ambiguous".into())
+            }
+        })
+        .await;
+        assert!(submit_err.is_err());
+        assert_eq!(submits.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Orchestration: delivery failure → no requeue action.
+        let decision = finalize_publish_outcome(
+            true,
+            &PromptSource::Channel(channel_id),
+            Some(&StopReason::EndTurn),
+            "answer",
+            false,
+        );
+        assert!(matches!(decision, PublishDecision::Publish(_)));
+        let fate = fate_from_decision_and_delivery(
+            decision,
+            Some(&meta),
+            Some(Err(submit_err.unwrap_err())),
+        );
+        match fate {
+            AssistantPublishFate::DeliveryFailure {
+                channel_id: cid, ..
+            } => {
+                assert_eq!(cid, channel_id, "source channel pinned on delivery failure");
+            }
+            other => panic!("expected DeliveryFailure, got {other:?}"),
+        }
+    }
+
+    /// Generation failures never call the submit seam; fate is requeue-class.
+    #[test]
+    fn publish_assistant_generation_errors_never_submit() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let batch = one_event_batch(match &channel {
+            PromptSource::Channel(id) => *id,
+            _ => unreachable!(),
+        });
+        let meta = assistant_reply_meta(&batch);
+
+        let cases: Vec<(PublishDecision, &str)> = vec![
+            (PublishDecision::EmptyFailure, "empty"),
+            (PublishDecision::OverflowFailure, "overflow"),
+            (
+                PublishDecision::NonSuccessStopReason("cancelled"),
+                "cancelled",
+            ),
+            (
+                PublishDecision::NonSuccessStopReason("max_tokens"),
+                "max_tokens",
+            ),
+            (
+                PublishDecision::NonSuccessStopReason("ambiguous_stop_reason"),
+                "race1",
+            ),
+        ];
+        for (decision, label) in cases {
+            // delivery_result = None proves submit was not consulted.
+            let fate = fate_from_decision_and_delivery(decision, Some(&meta), None);
+            assert!(
+                matches!(fate, AssistantPublishFate::GenerationFailure(_)),
+                "{label}: must be GenerationFailure (requeue), not publish/delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_assistant_opt_in_stop_reasons_select_requeue_not_publish() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        // empty
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "", false),
+            PublishDecision::EmptyFailure
+        );
+        // overflow
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "x", true),
+            PublishDecision::OverflowFailure
+        );
+        // non-EndTurn
+        for (stop, reason) in [
+            (StopReason::Cancelled, "cancelled"),
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::MaxTurnRequests, "max_turn_requests"),
+            (StopReason::Refusal, "refusal"),
+        ] {
+            assert_eq!(
+                finalize_publish_outcome(true, &channel, Some(&stop), "text", false),
+                PublishDecision::NonSuccessStopReason(reason)
+            );
+        }
+        // Race-1
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, None, "text", false),
+            PublishDecision::NonSuccessStopReason("ambiguous_stop_reason")
+        );
+    }
+
+    #[test]
+    fn working_signals_established_on_nonempty_reaction_ids() {
+        // Requeue/redispatch contract: every run_prompt_task dispatch with
+        // events re-establishes both 👀 and 💬 at task start.
+        assert!(should_establish_working_signals(&[
+            "aa".into(),
+            "bb".into()
+        ]));
+        assert!(!should_establish_working_signals(&[]));
+        let emojis = working_signal_emojis();
+        assert!(emojis.contains(&REACTION_SEEN));
+        assert!(emojis.contains(&REACTION_WORKING));
+        assert_eq!(emojis.len(), 2);
     }
 }
