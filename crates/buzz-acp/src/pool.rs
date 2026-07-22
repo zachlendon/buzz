@@ -19,7 +19,7 @@
 //!
 //! `AcpClient` is NOT Clone — ownership moves out on claim and back on return.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -476,6 +476,74 @@ pub struct PromptContext {
     /// When true, publish collected ACP assistant text into the source channel
     /// on EndTurn only. See `Config::publish_assistant_messages`.
     pub publish_assistant_messages: bool,
+    /// Trigger event IDs for which a managed assistant reply was already
+    /// published in this process. Bounded LRU so re-dispatch of the same owner
+    /// event cannot post a second kind:9. Shared across prompt tasks.
+    pub published_trigger_ids: Arc<Mutex<PublishedTriggerSet>>,
+}
+
+/// Default capacity for [`PublishedTriggerSet`] (process-lifetime dedupe).
+pub(crate) const PUBLISHED_TRIGGER_SET_CAPACITY: usize = 1024;
+
+/// Bounded set of trigger event hex IDs that already received a managed reply.
+///
+/// Insertion order is tracked so the oldest entries evict when capacity is hit.
+/// Pure and unit-testable without an agent subprocess.
+#[derive(Debug, Default)]
+pub struct PublishedTriggerSet {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl PublishedTriggerSet {
+    /// Create a set with the given maximum number of retained IDs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Whether `event_id` was already recorded as published.
+    pub fn contains(&self, event_id: &str) -> bool {
+        self.ids.contains(event_id)
+    }
+
+    /// Try to claim the publish slot for `event_id`.
+    ///
+    /// Returns `true` if this is the first claim (caller may publish).
+    /// Returns `false` if already claimed (caller must skip a second publish).
+    pub fn try_claim(&mut self, event_id: &str) -> bool {
+        if self.ids.contains(event_id) {
+            return false;
+        }
+        // Evict oldest until there is room for the new id.
+        while self.ids.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.ids.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.ids.insert(event_id.to_string());
+        self.order.push_back(event_id.to_string());
+        true
+    }
+
+    /// Number of retained IDs (test helper).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Pure helper: skip a second managed publish when the trigger was already claimed.
+///
+/// Returns `true` when the caller should Continue without submit.
+pub(crate) fn should_skip_duplicate_trigger_publish(already_published: bool) -> bool {
+    already_published
 }
 
 impl AgentPool {
@@ -2580,21 +2648,29 @@ pub(crate) fn render_canvas_section(event_id: &str, timestamp: &str, channel_uui
     )
 }
 
-/// Fetch conversation context (thread or DM) for a batch before prompting.
+/// Fetch conversation context (thread, DM, or top-level channel) for a batch
+/// before prompting.
 ///
 /// Returns `None` if:
-/// - The event is a plain channel message (not a thread reply, not a DM)
-/// - The REST fetch fails or times out (graceful degradation)
+/// - The REST/Nostr fetch fails or times out (graceful degradation)
 /// - `context_message_limit` is 0
+/// - Channel history is empty after excluding the triggering event(s)
 ///
 /// For batches with multiple events, thread context is fetched for the **last**
 /// reply event only (most recent = most likely to need a response).
+///
+/// Plain top-level channel messages (not thread, not DM) fetch recent channel
+/// history so short follow-ups like "the request above" resolve against prior
+/// owner content included in the prompt.
 async fn fetch_conversation_context(
     batch: &FlushBatch,
     channel_info: &Option<PromptChannelInfo>,
     ctx: &PromptContext,
 ) -> Option<ConversationContext> {
     let limit = ctx.context_message_limit;
+    if limit == 0 {
+        return None;
+    }
     let is_dm = channel_info
         .as_ref()
         .map(|ci| ci.channel_type == "dm")
@@ -2614,7 +2690,10 @@ async fn fetch_conversation_context(
         return fetch_dm_context(batch.channel_id, limit, &ctx.rest_client).await;
     }
 
-    None
+    // Plain top-level channel: recent messages in the same #h scope.
+    // Exclude batch event IDs so the trigger is not duplicated with [Event].
+    let exclude_ids: HashSet<String> = batch.events.iter().map(|be| be.event.id.to_hex()).collect();
+    fetch_channel_context(batch.channel_id, limit, &exclude_ids, &ctx.rest_client).await
 }
 
 /// Normalize AND validate a pubkey for the batch profile API request.
@@ -2647,7 +2726,8 @@ fn collect_prompt_pubkeys(
 
     let context_messages = match conversation_context {
         Some(ConversationContext::Thread { messages, .. })
-        | Some(ConversationContext::Dm { messages, .. }) => Some(messages),
+        | Some(ConversationContext::Dm { messages, .. })
+        | Some(ConversationContext::Channel { messages, .. }) => Some(messages),
         None => None,
     };
 
@@ -2877,6 +2957,60 @@ async fn fetch_dm_context(
     .await
 }
 
+/// Fetch top-level channel context via Nostr query: recent messages by `#h` tag.
+///
+/// Same filter shape as [`fetch_dm_context`], but returns
+/// [`ConversationContext::Channel`] and drops any events whose IDs appear in
+/// `exclude_ids` (typically the triggering batch events) so they are not
+/// duplicated with the `[Event]` prompt section.
+async fn fetch_channel_context(
+    channel_id: Uuid,
+    limit: u32,
+    exclude_ids: &HashSet<String>,
+    rest: &RestClient,
+) -> Option<ConversationContext> {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+    let ch_str = channel_id.to_string();
+    // Request a few extra so that after excluding the trigger we still have
+    // up to `limit` prior messages when the trigger is in the page.
+    let fetch_limit = (limit as usize).saturating_add(exclude_ids.len()).max(1);
+    let filter = nostr::Filter::new()
+        .kinds([
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+        ])
+        .custom_tags(h_tag, [ch_str.as_str()])
+        .limit(fetch_limit);
+
+    fetch_with_retry(|| async {
+        match timeout(
+            CONTEXT_FETCH_TIMEOUT,
+            rest.query(std::slice::from_ref(&filter)),
+        )
+        .await
+        {
+            Ok(Ok(json)) => parse_nostr_channel_response(json, limit, exclude_ids),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    "channel context fetch failed: {e} — will retry"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    "channel context fetch timed out — will retry"
+                );
+                None
+            }
+        }
+    })
+    .await
+}
+
 /// Parse the legacy REST thread response (used in tests only).
 #[cfg(test)]
 fn parse_thread_response(json: serde_json::Value) -> Option<ConversationContext> {
@@ -3031,11 +3165,65 @@ fn parse_nostr_thread_response(
 ///
 /// Events arrive in relay order (newest first); reversed to chronological.
 fn parse_nostr_dm_response(json: serde_json::Value, limit: u32) -> Option<ConversationContext> {
+    let messages = parse_nostr_message_list(json, limit, None)?;
+    let truncated = messages.len() >= limit as usize;
+    let total = if truncated {
+        messages.len() + 1
+    } else {
+        messages.len()
+    };
+    Some(ConversationContext::Dm {
+        messages,
+        total,
+        truncated,
+    })
+}
+
+/// Parse a Nostr query response into top-level channel context.
+///
+/// Same chronological ordering as DM parsing. Events whose `id` is in
+/// `exclude_ids` are dropped (triggering batch events). After exclusion the
+/// list is truncated to `limit` most-recent messages (still chronological).
+fn parse_nostr_channel_response(
+    json: serde_json::Value,
+    limit: u32,
+    exclude_ids: &HashSet<String>,
+) -> Option<ConversationContext> {
+    let messages = parse_nostr_message_list(json, limit, Some(exclude_ids))?;
+    let truncated = messages.len() >= limit as usize;
+    let total = if truncated {
+        messages.len() + 1
+    } else {
+        messages.len()
+    };
+    Some(ConversationContext::Channel {
+        messages,
+        total,
+        truncated,
+    })
+}
+
+/// Shared Nostr event-array → chronological [`ContextMessage`] list.
+///
+/// When `exclude_ids` is `Some`, events whose hex `id` is in the set are
+/// skipped. After filtering/sorting, keeps at most `limit` **most recent**
+/// messages (still returned oldest-first for the prompt).
+fn parse_nostr_message_list(
+    json: serde_json::Value,
+    limit: u32,
+    exclude_ids: Option<&HashSet<String>>,
+) -> Option<Vec<ContextMessage>> {
     let events = json.as_array()?;
 
     let mut messages: Vec<(u64, ContextMessage)> = events
         .iter()
         .filter_map(|ev| {
+            if let Some(exclude) = exclude_ids {
+                let ev_id = ev.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if exclude.contains(ev_id) {
+                    return None;
+                }
+            }
             let ts = ev.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
             json_to_context_message(ev).map(|msg| (ts, msg))
         })
@@ -3044,23 +3232,19 @@ fn parse_nostr_dm_response(json: serde_json::Value, limit: u32) -> Option<Conver
     // Sort chronologically (oldest first).
     messages.sort_by_key(|(ts, _)| *ts);
 
-    let messages: Vec<ContextMessage> = messages.into_iter().map(|(_, msg)| msg).collect();
-    let truncated = messages.len() >= limit as usize;
-    let total = if truncated {
-        messages.len() + 1
-    } else {
-        messages.len()
-    };
-
-    if messages.is_empty() {
-        return None;
+    // Cap to the most recent `limit` messages while keeping chronological order.
+    let limit = limit as usize;
+    if limit > 0 && messages.len() > limit {
+        let skip = messages.len() - limit;
+        messages = messages.into_iter().skip(skip).collect();
     }
 
-    Some(ConversationContext::Dm {
-        messages,
-        total,
-        truncated,
-    })
+    let messages: Vec<ContextMessage> = messages.into_iter().map(|(_, msg)| msg).collect();
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages)
+    }
 }
 
 /// Return the batch for requeue only in Queue mode; drop it in Drop mode.
@@ -3672,18 +3856,24 @@ pub(crate) fn publishable_assistant_text(raw: &str) -> Option<&str> {
 pub(crate) enum PublishDecision {
     /// Flag off or heartbeat — outer path keeps the real `Ok(stop_reason)`.
     NoOp,
-    /// Flag on, channel source, EndTurn, non-empty non-overflow text — publish.
+    /// Flag on, channel source, EndTurn, non-empty non-overflow text, ≥1 tool_call — publish.
     Publish(String),
     /// Flag on, channel source, EndTurn, empty/whitespace text — must not silent-succeed.
     EmptyFailure,
     /// Flag on, channel source, EndTurn, capture overflowed the byte ceiling.
     /// Never publish truncated text; requeue as generation failure.
     OverflowFailure,
+    /// Flag on, channel source, EndTurn, non-empty text, but zero structured
+    /// tool_calls — ungrounded meta-summary; fail closed (no publish).
+    NoToolCallsFailure,
     /// Flag on, channel source, non-EndTurn terminal (or Race-1 unknown).
     /// Caller must return `PromptOutcome::Error` + requeue — never publish.
     /// Values: `"cancelled"` | `"max_tokens"` | `"max_turn_requests"` |
     /// `"refusal"` | `"ambiguous_stop_reason"`.
     NonSuccessStopReason(&'static str),
+    /// Trigger event already had a managed reply published in this process.
+    /// Continue without a second submit (batch completes; no requeue loop).
+    AlreadyPublished,
 }
 
 /// Pure stop-reason gate for the opt-in publish path (no text inspection).
@@ -3735,16 +3925,20 @@ pub(crate) fn race1_opt_in_must_requeue(publish_enabled: bool, source: &PromptSo
 /// `stop_reason: None` means Race-1 / stop reason unknown (prompt Ok lost).
 /// `text` is the raw drained assistant buffer (may be empty).
 /// `overflow` means the bounded capture hit its ceiling — never publish.
+/// `tool_call_count` is the number of structured `tool_call` updates observed
+/// during the prompt — EndTurn text with zero tools is rejected as ungrounded.
 ///
-/// Only `Some(EndTurn)` with non-empty non-overflow text yields `Publish`.
-/// Cancelled / MaxTokens / MaxTurnRequests / Refusal / Race-1 (`None`) yield
-/// `NonSuccessStopReason` when opt-in is on (requeue; never silent consume).
+/// Only `Some(EndTurn)` with non-empty non-overflow text **and** at least one
+/// structured tool_call yields `Publish`. Cancelled / MaxTokens /
+/// MaxTurnRequests / Refusal / Race-1 (`None`) yield `NonSuccessStopReason`
+/// when opt-in is on (requeue; never silent consume).
 pub(crate) fn finalize_publish_outcome(
     publish_enabled: bool,
     source: &PromptSource,
     stop_reason: Option<&StopReason>,
     text: &str,
     overflow: bool,
+    tool_call_count: usize,
 ) -> PublishDecision {
     match opt_in_terminal_action(publish_enabled, source, stop_reason) {
         OptInTerminalAction::NoOp => PublishDecision::NoOp,
@@ -3754,11 +3948,29 @@ pub(crate) fn finalize_publish_outcome(
                 PublishDecision::OverflowFailure
             } else {
                 match publishable_assistant_text(text) {
-                    Some(content) => PublishDecision::Publish(content.to_string()),
                     None => PublishDecision::EmptyFailure,
+                    Some(_) if tool_call_count == 0 => PublishDecision::NoToolCallsFailure,
+                    Some(content) => PublishDecision::Publish(content.to_string()),
                 }
             }
         }
+    }
+}
+
+/// Pure gate: after a [`PublishDecision::Publish`], skip submit when this
+/// trigger event id was already published in-process.
+///
+/// Other decisions pass through unchanged. Used by unit tests and the live
+/// publish path so re-dispatch cannot emit a second managed kind:9.
+pub(crate) fn apply_trigger_publish_dedupe(
+    decision: PublishDecision,
+    already_published: bool,
+) -> PublishDecision {
+    match decision {
+        PublishDecision::Publish(_) if should_skip_duplicate_trigger_publish(already_published) => {
+            PublishDecision::AlreadyPublished
+        }
+        other => other,
     }
 }
 
@@ -3955,14 +4167,41 @@ async fn maybe_publish_assistant_on_success(
     // Drain before deciding so Cancelled / MaxTokens / Race-1 cannot leave
     // partial text for a subsequent turn to publish.
     let taken = agent.acp.take_assistant_message();
-    match finalize_publish_outcome(
+    let mut decision = finalize_publish_outcome(
         ctx.publish_assistant_messages,
         source,
         stop_reason,
         &taken.text,
         taken.overflow,
-    ) {
-        PublishDecision::NoOp => AssistantPublishFate::Continue,
+        taken.tool_call_titles.len(),
+    );
+
+    // At-most-once per trigger event id (process-lifetime bounded set).
+    let trigger_id = batch
+        .and_then(|b| b.events.last())
+        .map(|be| be.event.id.to_hex());
+    if matches!(decision, PublishDecision::Publish(_)) {
+        if let Some(ref id) = trigger_id {
+            let already = ctx
+                .published_trigger_ids
+                .lock()
+                .map(|set| set.contains(id))
+                .unwrap_or(false);
+            decision = apply_trigger_publish_dedupe(decision, already);
+        }
+    }
+
+    match decision {
+        PublishDecision::NoOp | PublishDecision::AlreadyPublished => {
+            if matches!(decision, PublishDecision::AlreadyPublished) {
+                tracing::info!(
+                    target: "pool::prompt",
+                    trigger = trigger_id.as_deref().unwrap_or(""),
+                    "skipping duplicate assistant publish for trigger event"
+                );
+            }
+            AssistantPublishFate::Continue
+        }
         PublishDecision::EmptyFailure => {
             tracing::warn!(
                 target: "pool::prompt",
@@ -3983,6 +4222,15 @@ async fn maybe_publish_assistant_on_success(
                 crate::acp::ASSISTANT_MESSAGE_MAX_BYTES
             )))
         }
+        PublishDecision::NoToolCallsFailure => {
+            tracing::warn!(
+                target: "pool::prompt",
+                "publish_assistant_messages: EndTurn text with zero structured tool_calls — rejecting ungrounded reply"
+            );
+            AssistantPublishFate::GenerationFailure(AcpError::Generation(
+                "assistant produced no tool calls (ungrounded reply rejected)".into(),
+            ))
+        }
         PublishDecision::NonSuccessStopReason(reason) => {
             tracing::warn!(
                 target: "pool::prompt",
@@ -4000,11 +4248,29 @@ async fn maybe_publish_assistant_on_success(
                     "assistant publish: channel source missing batch".into(),
                 ));
             };
+            // Claim the slot before submit so concurrent re-dispatch cannot
+            // race a second kind:9 for the same trigger.
+            if let Some(ref id) = trigger_id {
+                let claimed = ctx
+                    .published_trigger_ids
+                    .lock()
+                    .map(|mut set| set.try_claim(id))
+                    .unwrap_or(true);
+                if !claimed {
+                    tracing::info!(
+                        target: "pool::prompt",
+                        trigger = %id,
+                        "trigger publish slot already claimed — skipping duplicate submit"
+                    );
+                    return AssistantPublishFate::Continue;
+                }
+            }
             let meta = assistant_reply_meta(batch);
             tracing::info!(
                 target: "pool::prompt",
                 channel = %meta.channel_id,
                 chars = content.len(),
+                tool_calls = taken.tool_call_titles.len(),
                 "publishing assistant message to source channel"
             );
             match publish_assistant_message(
@@ -4048,13 +4314,18 @@ pub(crate) fn fate_from_decision_and_delivery(
     delivery_result: Option<Result<(), String>>,
 ) -> AssistantPublishFate {
     match decision {
-        PublishDecision::NoOp => AssistantPublishFate::Continue,
+        PublishDecision::NoOp | PublishDecision::AlreadyPublished => AssistantPublishFate::Continue,
         PublishDecision::EmptyFailure => AssistantPublishFate::GenerationFailure(
             AcpError::Generation("assistant produced no publishable text".into()),
         ),
         PublishDecision::OverflowFailure => AssistantPublishFate::GenerationFailure(
             AcpError::Generation("assistant message exceeded capture ceiling".into()),
         ),
+        PublishDecision::NoToolCallsFailure => {
+            AssistantPublishFate::GenerationFailure(AcpError::Generation(
+                "assistant produced no tool calls (ungrounded reply rejected)".into(),
+            ))
+        }
         PublishDecision::NonSuccessStopReason(reason) => {
             AssistantPublishFate::GenerationFailure(AcpError::Generation(format!(
                 "assistant turn ended with non-publishable stop reason: {reason}"
@@ -5882,6 +6153,9 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
             publish_assistant_messages: false,
+            published_trigger_ids: Arc::new(Mutex::new(PublishedTriggerSet::with_capacity(
+                PUBLISHED_TRIGGER_SET_CAPACITY,
+            ))),
         }
     }
 
@@ -6226,16 +6500,16 @@ mod tests {
         let channel = PromptSource::Channel(Uuid::new_v4());
         let end_turn = StopReason::EndTurn;
         assert_eq!(
-            finalize_publish_outcome(true, &channel, Some(&end_turn), "   ", false),
+            finalize_publish_outcome(true, &channel, Some(&end_turn), "   ", false, 1),
             PublishDecision::EmptyFailure
         );
         assert_eq!(
-            finalize_publish_outcome(true, &channel, Some(&end_turn), "answer", false),
+            finalize_publish_outcome(true, &channel, Some(&end_turn), "answer", false, 1),
             PublishDecision::Publish("answer".into())
         );
         // Flag off: empty text is fine (agents use CLI tools).
         assert_eq!(
-            finalize_publish_outcome(false, &channel, Some(&end_turn), "", false),
+            finalize_publish_outcome(false, &channel, Some(&end_turn), "", false, 0),
             PublishDecision::NoOp
         );
         // Heartbeat never publishes.
@@ -6245,7 +6519,8 @@ mod tests {
                 &PromptSource::Heartbeat,
                 Some(&end_turn),
                 "secret",
-                false
+                false,
+                1
             ),
             PublishDecision::NoOp
         );
@@ -6255,12 +6530,40 @@ mod tests {
     fn end_turn_with_text_publishes_when_enabled() {
         let channel = PromptSource::Channel(Uuid::new_v4());
         assert_eq!(
-            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "hello", false),
+            finalize_publish_outcome(
+                true,
+                &channel,
+                Some(&StopReason::EndTurn),
+                "hello",
+                false,
+                1
+            ),
             PublishDecision::Publish("hello".into())
         );
         assert_eq!(
             opt_in_terminal_action(true, &channel, Some(&StopReason::EndTurn)),
             OptInTerminalAction::MayPublish
+        );
+    }
+
+    #[test]
+    fn end_turn_with_text_but_zero_tools_is_failure() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        assert_eq!(
+            finalize_publish_outcome(
+                true,
+                &channel,
+                Some(&StopReason::EndTurn),
+                "ungrounded meta-summary of the request above",
+                false,
+                0
+            ),
+            PublishDecision::NoToolCallsFailure
+        );
+        // Empty still wins over no-tools (generation empty, not ungrounded).
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "  ", false, 0),
+            PublishDecision::EmptyFailure
         );
     }
 
@@ -6273,7 +6576,8 @@ mod tests {
                 &channel,
                 Some(&StopReason::EndTurn),
                 "truncated but long",
-                true
+                true,
+                1
             ),
             PublishDecision::OverflowFailure
         );
@@ -6284,7 +6588,8 @@ mod tests {
                 &channel,
                 Some(&StopReason::EndTurn),
                 "truncated",
-                true
+                true,
+                0
             ),
             PublishDecision::NoOp
         );
@@ -6300,7 +6605,8 @@ mod tests {
                 &channel,
                 Some(&StopReason::Cancelled),
                 "partial answer",
-                false
+                false,
+                1
             ),
             PublishDecision::NonSuccessStopReason("cancelled")
         );
@@ -6319,7 +6625,8 @@ mod tests {
                 &channel,
                 Some(&StopReason::MaxTokens),
                 "truncated",
-                false
+                false,
+                0
             ),
             PublishDecision::NonSuccessStopReason("max_tokens")
         );
@@ -6338,7 +6645,8 @@ mod tests {
                 &channel,
                 Some(&StopReason::MaxTurnRequests),
                 "partial",
-                false
+                false,
+                0
             ),
             PublishDecision::NonSuccessStopReason("max_turn_requests")
         );
@@ -6348,7 +6656,7 @@ mod tests {
     fn refusal_is_non_success_when_enabled() {
         let channel = PromptSource::Channel(Uuid::new_v4());
         assert_eq!(
-            finalize_publish_outcome(true, &channel, Some(&StopReason::Refusal), "nope", false),
+            finalize_publish_outcome(true, &channel, Some(&StopReason::Refusal), "nope", false, 0),
             PublishDecision::NonSuccessStopReason("refusal")
         );
     }
@@ -6358,7 +6666,7 @@ mod tests {
         let channel = PromptSource::Channel(Uuid::new_v4());
         // Race-1: prompt Ok lost; stop reason unknown — never publish.
         assert_eq!(
-            finalize_publish_outcome(true, &channel, None, "maybe complete", false),
+            finalize_publish_outcome(true, &channel, None, "maybe complete", false, 1),
             PublishDecision::NonSuccessStopReason("ambiguous_stop_reason")
         );
         assert_eq!(
@@ -6381,7 +6689,7 @@ mod tests {
         ];
         for stop in reasons {
             assert_eq!(
-                finalize_publish_outcome(false, &channel, stop, "text", false),
+                finalize_publish_outcome(false, &channel, stop, "text", false, 0),
                 PublishDecision::NoOp,
                 "default-off must NoOp for stop_reason={stop:?}"
             );
@@ -6535,6 +6843,7 @@ mod tests {
             Some(&StopReason::EndTurn),
             "answer",
             false,
+            1,
         );
         assert!(matches!(decision, PublishDecision::Publish(_)));
         let fate = fate_from_decision_and_delivery(
@@ -6565,6 +6874,7 @@ mod tests {
         let cases: Vec<(PublishDecision, &str)> = vec![
             (PublishDecision::EmptyFailure, "empty"),
             (PublishDecision::OverflowFailure, "overflow"),
+            (PublishDecision::NoToolCallsFailure, "no_tools"),
             (
                 PublishDecision::NonSuccessStopReason("cancelled"),
                 "cancelled",
@@ -6593,12 +6903,12 @@ mod tests {
         let channel = PromptSource::Channel(Uuid::new_v4());
         // empty
         assert_eq!(
-            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "", false),
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "", false, 0),
             PublishDecision::EmptyFailure
         );
         // overflow
         assert_eq!(
-            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "x", true),
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "x", true, 1),
             PublishDecision::OverflowFailure
         );
         // non-EndTurn
@@ -6609,14 +6919,19 @@ mod tests {
             (StopReason::Refusal, "refusal"),
         ] {
             assert_eq!(
-                finalize_publish_outcome(true, &channel, Some(&stop), "text", false),
+                finalize_publish_outcome(true, &channel, Some(&stop), "text", false, 1),
                 PublishDecision::NonSuccessStopReason(reason)
             );
         }
         // Race-1
         assert_eq!(
-            finalize_publish_outcome(true, &channel, None, "text", false),
+            finalize_publish_outcome(true, &channel, None, "text", false, 1),
             PublishDecision::NonSuccessStopReason("ambiguous_stop_reason")
+        );
+        // zero tools + text → ungrounded
+        assert_eq!(
+            finalize_publish_outcome(true, &channel, Some(&StopReason::EndTurn), "meta", false, 0),
+            PublishDecision::NoToolCallsFailure
         );
     }
 
@@ -6633,5 +6948,158 @@ mod tests {
         assert!(emojis.contains(&REACTION_SEEN));
         assert!(emojis.contains(&REACTION_WORKING));
         assert_eq!(emojis.len(), 2);
+    }
+
+    // ── Gate 2: publish decision + trigger dedupe (no network) ─────────────
+
+    #[test]
+    fn gate2_end_turn_with_two_tools_is_single_publish_candidate() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let final_text =
+            "ACME Corp has 3 open Q3 items (sources: organization_lookup, attention_list).";
+        let decision = finalize_publish_outcome(
+            true,
+            &channel,
+            Some(&StopReason::EndTurn),
+            final_text,
+            false,
+            2, // organization_lookup + attention_list
+        );
+        assert_eq!(decision, PublishDecision::Publish(final_text.into()));
+    }
+
+    #[test]
+    fn gate2_second_publish_same_trigger_is_already_published() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let trigger = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut set = PublishedTriggerSet::with_capacity(8);
+        assert!(set.try_claim(trigger), "first claim must succeed");
+
+        let first = finalize_publish_outcome(
+            true,
+            &channel,
+            Some(&StopReason::EndTurn),
+            "grounded answer",
+            false,
+            1,
+        );
+        assert!(matches!(first, PublishDecision::Publish(_)));
+        // Simulate second EndTurn for the same trigger (re-dispatch).
+        let second = apply_trigger_publish_dedupe(first, set.contains(trigger));
+        assert_eq!(second, PublishDecision::AlreadyPublished);
+        // Fate: Continue (batch completes, no second submit, no requeue loop).
+        let fate = fate_from_decision_and_delivery(second, None, None);
+        assert!(matches!(fate, AssistantPublishFate::Continue));
+        assert!(should_skip_duplicate_trigger_publish(true));
+        assert!(!should_skip_duplicate_trigger_publish(false));
+    }
+
+    #[test]
+    fn gate2_no_tools_meta_summary_is_generation_failure() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let decision = finalize_publish_outcome(
+            true,
+            &channel,
+            Some(&StopReason::EndTurn),
+            "Based on history, here is a meta-summary without tools.",
+            false,
+            0,
+        );
+        assert_eq!(decision, PublishDecision::NoToolCallsFailure);
+        let fate = fate_from_decision_and_delivery(decision, None, None);
+        match fate {
+            AssistantPublishFate::GenerationFailure(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("no tool calls"),
+                    "error must mention no tool calls: {msg}"
+                );
+            }
+            other => panic!("expected GenerationFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate2_raw_tool_json_style_text_without_tools_rejected() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        // Model dumped tool-shaped JSON as plain text without structured tool_call.
+        let decision = finalize_publish_outcome(
+            true,
+            &channel,
+            Some(&StopReason::EndTurn),
+            r#"{"tool":"organization_lookup","args":{"name":"ACME"}}"#,
+            false,
+            0,
+        );
+        assert_eq!(decision, PublishDecision::NoToolCallsFailure);
+    }
+
+    #[test]
+    fn published_trigger_set_evicts_oldest_at_capacity() {
+        let mut set = PublishedTriggerSet::with_capacity(2);
+        assert!(set.try_claim("id-1"));
+        assert!(set.try_claim("id-2"));
+        assert_eq!(set.len(), 2);
+        assert!(!set.try_claim("id-1"), "id-1 still present");
+        assert!(set.try_claim("id-3"), "evict id-1 to make room");
+        assert!(!set.contains("id-1"), "oldest must be evicted");
+        assert!(set.contains("id-2"));
+        assert!(set.contains("id-3"));
+    }
+
+    #[test]
+    fn parse_nostr_channel_response_excludes_trigger_and_orders() {
+        let trigger = "1111111111111111111111111111111111111111111111111111111111111111";
+        let prior = "0000000000000000000000000000000000000000000000000000000000000002";
+        let json = serde_json::json!([
+            {
+                "id": trigger,
+                "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content": "request above now",
+                "created_at": 200
+            },
+            {
+                "id": prior,
+                "pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "content": "long pilot request body with organization ACME",
+                "created_at": 100
+            }
+        ]);
+        let mut exclude = HashSet::new();
+        exclude.insert(trigger.to_string());
+        let ctx = parse_nostr_channel_response(json, 12, &exclude).expect("should parse");
+        match ctx {
+            ConversationContext::Channel {
+                messages,
+                truncated,
+                ..
+            } => {
+                assert_eq!(messages.len(), 1);
+                assert!(!truncated);
+                assert_eq!(
+                    messages[0].content,
+                    "long pilot request body with organization ACME"
+                );
+                assert!(
+                    !messages.iter().any(|m| m.content.contains("request above")),
+                    "trigger content must be excluded from channel context"
+                );
+            }
+            other => panic!("expected Channel context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_nostr_channel_response_empty_after_exclude_is_none() {
+        let trigger = "1111111111111111111111111111111111111111111111111111111111111111";
+        let json = serde_json::json!([{
+            "id": trigger,
+            "pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "content": "only the trigger",
+            "created_at": 100
+        }]);
+        let mut exclude = HashSet::new();
+        exclude.insert(trigger.to_string());
+        assert!(parse_nostr_channel_response(json, 12, &exclude).is_none());
     }
 }

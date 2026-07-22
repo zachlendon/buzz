@@ -57,9 +57,10 @@ pub enum CapabilityPolicy {
 }
 
 /// Ambient keys stripped from a Personal Delegate child before the fixed
-/// loopback Ollama environment is force-applied. Includes foreign-agent,
+/// Ollama Cloud environment is force-applied. Includes foreign-agent,
 /// multi-provider, and Buzz credential variables that must never reach the
-/// confined native buzz-agent process.
+/// confined native buzz-agent process. Provider API key is stripped here and
+/// re-injected only from `extra_env` (FD-derived via persona_env_vars).
 const PERSONAL_DELEGATE_AMBIENT_STRIP: &[&str] = &[
     "CODEX_CONFIG",
     "CODEX_API_KEY",
@@ -75,6 +76,10 @@ const PERSONAL_DELEGATE_AMBIENT_STRIP: &[&str] = &[
     "BUZZ_AGENT_NO_HINTS",
     "BUZZ_AGENT_PERSONAL_DELEGATE_MODE",
     "BUZZ_AGENT_MAX_PARALLEL_TOOLS",
+    "BUZZ_AGENT_MAX_OUTPUT_TOKENS",
+    "BUZZ_AGENT_MAX_ROUNDS",
+    "BUZZ_AGENT_LLM_TIMEOUT_SECS",
+    "BUZZ_AGENT_TOOL_TIMEOUT_SECS",
     "MCP_HOOK_SERVERS",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_MODEL",
@@ -201,10 +206,15 @@ pub enum AcpError {
 /// Produced by [`AcpClient::take_assistant_message`]. `overflow` means the
 /// bounded capture hit [`ASSISTANT_MESSAGE_MAX_BYTES`] and the text must not
 /// be published as a final answer.
+///
+/// `tool_call_titles` lists structured `tool_call` session/update titles
+/// observed during the prompt (cleared with the buffer). Used by the opt-in
+/// publish path to fail closed on ungrounded EndTurn text with zero tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TakenAssistantMessage {
     pub text: String,
     pub overflow: bool,
+    pub tool_call_titles: Vec<String>,
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -314,6 +324,10 @@ pub struct AcpClient {
     /// on structured `tool_call`, and on [`take_assistant_message`]. Overflow
     /// text is never published.
     assistant_message_overflow: bool,
+    /// Titles of structured `tool_call` session/updates during the current
+    /// prompt attempt. Cleared at prompt start and on [`take_assistant_message`].
+    /// Not cleared on individual tool_call (titles accumulate across tool rounds).
+    tool_calls_this_prompt: Vec<String>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -550,8 +564,14 @@ impl AcpClient {
         if capability_policy == CapabilityPolicy::PersonalDelegateMcpOnly {
             // Native buzz-agent Personal Delegate: clear hostile ambient provider,
             // model, credential, and hint overrides, then unconditionally force the
-            // fixed loopback Ollama environment. Operator-wins and CODEX_CONFIG
+            // fixed Ollama Cloud environment. Operator-wins and CODEX_CONFIG
             // merges never apply on this path.
+            //
+            // Order matters for the provider key:
+            //   1. strip ambient OPENAI_COMPAT_* (including ambient API key)
+            //   2. force PERSONAL_DELEGATE_AGENT_ENV (no API key constant)
+            //   3. apply extra_env last (carries FD-derived OPENAI_COMPAT_API_KEY)
+            // so a parent ambient key can never win over the FD-delivered secret.
             for key in PERSONAL_DELEGATE_AMBIENT_STRIP {
                 cmd.env_remove(key);
             }
@@ -638,6 +658,7 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             assistant_message: String::new(),
             assistant_message_overflow: false,
+            tool_calls_this_prompt: Vec::new(),
         })
     }
 
@@ -822,10 +843,12 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        // Fresh buffer for this prompt attempt so partial text / overflow from
-        // a prior cancel/timeout never leaks into a later publish decision.
+        // Fresh buffer for this prompt attempt so partial text / overflow /
+        // tool-call titles from a prior cancel/timeout never leak into a later
+        // publish decision.
         self.assistant_message.clear();
         self.assistant_message_overflow = false;
+        self.tool_calls_this_prompt.clear();
 
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
@@ -931,17 +954,20 @@ impl AcpClient {
         self.goose_usage.take()
     }
 
-    /// Drain the concatenated `agent_message_chunk` text and overflow flag
-    /// collected for the current prompt attempt. Subsequent calls return empty
-    /// non-overflow until more chunks arrive (or the next prompt clears).
+    /// Drain the concatenated `agent_message_chunk` text, overflow flag, and
+    /// structured tool-call titles collected for the current prompt attempt.
+    /// Subsequent calls return empty non-overflow with no titles until more
+    /// updates arrive (or the next prompt clears).
     ///
     /// Intended for the opt-in `publish_assistant_messages` path in `pool.rs`.
     /// Callers must never publish when `overflow` is true — truncated capture
-    /// is not a valid final answer.
+    /// is not a valid final answer. Callers that require grounded replies must
+    /// also require non-empty `tool_call_titles`.
     pub fn take_assistant_message(&mut self) -> TakenAssistantMessage {
         TakenAssistantMessage {
             text: std::mem::take(&mut self.assistant_message),
             overflow: std::mem::take(&mut self.assistant_message_overflow),
+            tool_call_titles: std::mem::take(&mut self.tool_calls_this_prompt),
         }
     }
 
@@ -1747,6 +1773,9 @@ impl AcpClient {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
+                // Accumulate titles for the fail-closed publish gate (require ≥1
+                // structured tool_call before publishing EndTurn text).
+                self.tool_calls_this_prompt.push(title.to_string());
                 tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
                 true
             }
@@ -2393,8 +2422,9 @@ mod tests {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
 
         // Hostile parent ambient values: credentials, provider, model, and
-        // BUZZ_AGENT_NO_HINTS=0 must not reach the child. Fixed Ollama env wins
-        // unconditionally (no operator-wins).
+        // BUZZ_AGENT_NO_HINTS=0 must not reach the child. Fixed Ollama Cloud
+        // env wins unconditionally (no operator-wins). FD-derived API key is
+        // supplied only via extra_env (mirrors persona_env_vars).
         let ambient = [
             ("OPENAI_API_KEY", "ambient-openai-key"),
             ("OPENAI_COMPAT_BASE_URL", "https://evil.example/v1"),
@@ -2408,6 +2438,8 @@ mod tests {
             ("BUZZ_AGENT_PROVIDER", "anthropic"),
             ("BUZZ_AGENT_MODEL", "hostile-remote-model"),
             ("BUZZ_AGENT_NO_HINTS", "0"),
+            ("BUZZ_AGENT_MAX_OUTPUT_TOKENS", "99999"),
+            ("BUZZ_AGENT_MAX_ROUNDS", "999"),
         ];
         let previous: Vec<(String, Option<String>)> = ambient
             .iter()
@@ -2418,14 +2450,24 @@ mod tests {
             std::env::set_var(key, value);
         }
 
-        // Empty extra_env proves the harness forces PERSONAL_DELEGATE_AGENT_ENV
-        // itself after clearing ambient keys (not only when callers re-supply it).
-        let fixed: Vec<(String, String)> = Vec::new();
+        // extra_env carries the FD-derived provider key (and re-states fixed
+        // env the way Config::from_args builds persona_env_vars). Ambient key
+        // must lose to this sentinel.
+        const FD_KEY_SENTINEL: &str = "fd-derived-provider-key-sentinel";
+        let mut extra_env: Vec<(String, String)> = crate::config::PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        extra_env.push((
+            "OPENAI_COMPAT_API_KEY".to_string(),
+            FD_KEY_SENTINEL.to_string(),
+        ));
 
         let script = r#"
 printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-<unset>}"
 printf 'OPENAI_COMPAT_BASE_URL=%s\n' "${OPENAI_COMPAT_BASE_URL-<unset>}"
 printf 'OPENAI_COMPAT_MODEL=%s\n' "${OPENAI_COMPAT_MODEL-<unset>}"
+printf 'OPENAI_COMPAT_API=%s\n' "${OPENAI_COMPAT_API-<unset>}"
 printf 'OPENAI_COMPAT_API_KEY=%s\n' "${OPENAI_COMPAT_API_KEY-<unset>}"
 printf 'BUZZ_PRIVATE_KEY=%s\n' "${BUZZ_PRIVATE_KEY-<unset>}"
 printf 'BUZZ_AUTH_TAG=%s\n' "${BUZZ_AUTH_TAG-<unset>}"
@@ -2436,13 +2478,17 @@ printf 'BUZZ_AGENT_PROVIDER=%s\n' "${BUZZ_AGENT_PROVIDER-<unset>}"
 printf 'BUZZ_AGENT_MODEL=%s\n' "${BUZZ_AGENT_MODEL-<unset>}"
 printf 'BUZZ_AGENT_NO_HINTS=%s\n' "${BUZZ_AGENT_NO_HINTS-<unset>}"
 printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_MODE-<unset>}"
+printf 'BUZZ_AGENT_MAX_OUTPUT_TOKENS=%s\n' "${BUZZ_AGENT_MAX_OUTPUT_TOKENS-<unset>}"
+printf 'BUZZ_AGENT_MAX_ROUNDS=%s\n' "${BUZZ_AGENT_MAX_ROUNDS-<unset>}"
+printf 'BUZZ_AGENT_LLM_TIMEOUT_SECS=%s\n' "${BUZZ_AGENT_LLM_TIMEOUT_SECS-<unset>}"
+printf 'BUZZ_AGENT_TOOL_TIMEOUT_SECS=%s\n' "${BUZZ_AGENT_TOOL_TIMEOUT_SECS-<unset>}"
 "#;
 
         let result = async {
             let mut client = AcpClient::spawn(
                 "bash",
                 &["-c".into(), script.into()],
-                &fixed,
+                &extra_env,
                 false,
                 CapabilityPolicy::PersonalDelegateMcpOnly,
             )
@@ -2479,16 +2525,28 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
             "ambient OpenAI key must be stripped: {result}"
         );
         assert!(
-            result.contains("OPENAI_COMPAT_BASE_URL=http://127.0.0.1:11434/v1"),
-            "fixed Ollama base URL must be forced: {result}"
+            result.contains("OPENAI_COMPAT_BASE_URL=https://ollama.com/v1"),
+            "fixed Ollama Cloud base URL must be forced: {result}"
         );
         assert!(
-            result.contains("OPENAI_COMPAT_MODEL=llama3.1:8b"),
-            "fixed model must be forced: {result}"
+            result.contains("OPENAI_COMPAT_MODEL=kimi-k2.7-code"),
+            "fixed cloud model must be forced: {result}"
         );
         assert!(
-            result.contains("OPENAI_COMPAT_API_KEY=ollama-local-only"),
-            "fixed non-secret sentinel must be forced: {result}"
+            result.contains("OPENAI_COMPAT_API=chat"),
+            "fixed chat API must be forced: {result}"
+        );
+        assert!(
+            result.contains(&format!("OPENAI_COMPAT_API_KEY={FD_KEY_SENTINEL}")),
+            "FD-derived API key from extra_env must win over ambient: {result}"
+        );
+        assert!(
+            !result.contains("ambient-compat-key"),
+            "ambient provider key must not reach the child: {result}"
+        );
+        assert!(
+            !result.contains("ollama-local-only"),
+            "local sentinel must not be used: {result}"
         );
         assert!(
             result.contains("BUZZ_PRIVATE_KEY=<unset>"),
@@ -2525,6 +2583,22 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
         assert!(
             result.contains("BUZZ_AGENT_PERSONAL_DELEGATE_MODE=1"),
             "Personal Delegate mode flag must be set: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_MAX_OUTPUT_TOKENS=2048"),
+            "product output-token bound must be forced: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_MAX_ROUNDS=8"),
+            "product max-rounds bound must be forced: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_LLM_TIMEOUT_SECS=120"),
+            "product LLM timeout must be forced: {result}"
+        );
+        assert!(
+            result.contains("BUZZ_AGENT_TOOL_TIMEOUT_SECS=30"),
+            "product tool timeout must be forced: {result}"
         );
     }
 
@@ -3862,6 +3936,11 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
             "pre-tool assistant text must be discarded on tool_call"
         );
         assert!(!taken.overflow);
+        assert_eq!(
+            taken.tool_call_titles,
+            vec!["search".to_string()],
+            "tool_call title must be tracked even when text is cleared"
+        );
     }
 
     #[tokio::test]
@@ -3906,9 +3985,69 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
         let taken = client.take_assistant_message();
         assert_eq!(taken.text, "Here is the answer.");
         assert!(!taken.overflow);
+        assert_eq!(taken.tool_call_titles, vec!["read_file".to_string()]);
         assert!(
             !taken.text.contains("pre-tool"),
             "must not concatenate pre-tool narration with the final answer"
+        );
+    }
+
+    /// Gate 2: full ACP adapter sequence — pre-tool meta, two tools, final synthesis.
+    #[tokio::test]
+    async fn gate2_pre_tool_meta_two_tools_final_synthesis_only() {
+        let mut client = spawn_inert_client().await;
+        // 1. Pre-tool narration (meta-summary style — must be discarded).
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "I'll summarize the request above and plan tool use…",
+        ));
+        // 2–3. Structured tool calls.
+        let _ =
+            client.handle_session_update(&tool_call_update_msg("organization_lookup", "execute"));
+        let _ = client.handle_session_update(&tool_call_update_msg("attention_list", "execute"));
+        // 4. Final human synthesis with sources.
+        let final_text =
+            "ACME Corp has 3 open Q3 attention items (sources: org lookup, attention list).";
+        let _ = client
+            .handle_session_update(&agent_chunk_update_msg("agent_message_chunk", final_text));
+
+        let taken = client.take_assistant_message();
+        assert_eq!(
+            taken.text, final_text,
+            "only post-tool final synthesis must be captured"
+        );
+        assert!(!taken.overflow);
+        assert!(
+            !taken.text.contains("summarize the request"),
+            "pre-tool meta must not leak into publish buffer"
+        );
+        assert_eq!(
+            taken.tool_call_titles,
+            vec![
+                "organization_lookup".to_string(),
+                "attention_list".to_string()
+            ],
+            "tool titles must be exactly the two structured tool_calls"
+        );
+
+        // Second take drains empty.
+        let again = client.take_assistant_message();
+        assert!(again.text.is_empty());
+        assert!(again.tool_call_titles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gate2_meta_summary_without_tools_has_empty_titles() {
+        let mut client = spawn_inert_client().await;
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "Based on the conversation history, here is a meta-summary of the request.",
+        ));
+        let taken = client.take_assistant_message();
+        assert!(!taken.text.is_empty());
+        assert!(
+            taken.tool_call_titles.is_empty(),
+            "ungrounded meta-summary must report zero tool_calls"
         );
     }
 
@@ -3985,12 +4124,14 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
         // the pre-write clear). Drive the clear directly.
         client.assistant_message.clear();
         client.assistant_message_overflow = false;
+        client.tool_calls_this_prompt.clear();
         let cleared = client.take_assistant_message();
         assert!(
             cleared.text.is_empty(),
             "prompt-start clear must discard partial text"
         );
         assert!(!cleared.overflow);
+        assert!(cleared.tool_call_titles.is_empty());
     }
 
     #[tokio::test]

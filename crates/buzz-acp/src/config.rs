@@ -47,39 +47,65 @@ pub enum ConfigError {
     ConfigFile(String),
 }
 
-const MIN_PRIVATE_KEY_FD: u32 = 3;
-const MAX_PRIVATE_KEY_FD: u32 = 1024;
+const MIN_SECRET_FD: u32 = 3;
+const MAX_SECRET_FD: u32 = 1024;
+/// Nostr private keys are short (nsec / hex); keep the bound tight.
 const PRIVATE_KEY_FD_MAX_LEN: usize = 256;
+/// Provider API keys (e.g. Ollama Cloud) may be longer bearer tokens.
+/// 4096 is a safe upper bound; oversized payloads fail closed.
+const PROVIDER_KEY_FD_MAX_LEN: usize = 4096;
+
+/// Personal Delegate cloud provider endpoint (Ollama Cloud OpenAI-compat).
+pub(crate) const PERSONAL_DELEGATE_PROVIDER_BASE_URL: &str = "https://ollama.com/v1";
+/// Exact model required for Personal Delegate — no fallback.
+pub(crate) const PERSONAL_DELEGATE_PROVIDER_MODEL: &str = "kimi-k2.7-code";
 
 /// Fixed, non-secret environment for the Personal Delegate native agent.
 ///
 /// `buzz-agent` has no native shell, filesystem, browser, or Keychain tools:
-/// it can only invoke MCP tools supplied by the ACP client.  Its model traffic
-/// is constrained to the local Ollama loopback endpoint.  Hints are disabled
-/// so no project instructions or skills become an additional file-read path.
+/// it can only invoke MCP tools supplied by the ACP client. Model traffic is
+/// constrained to Ollama Cloud (`kimi-k2.7-code`). The provider API key is
+/// **not** in this table — it is injected only from `--provider-key-fd`.
+/// Hints are disabled so no project instructions or skills become an
+/// additional file-read path. Product bounds are pinned here because the
+/// ACP ambient strip removes parent `BUZZ_AGENT_*` values.
 pub(crate) const PERSONAL_DELEGATE_AGENT_ENV: &[(&str, &str)] = &[
     ("BUZZ_AGENT_PROVIDER", "openai"),
-    ("OPENAI_COMPAT_BASE_URL", "http://127.0.0.1:11434/v1"),
-    ("OPENAI_COMPAT_MODEL", "llama3.1:8b"),
+    (
+        "OPENAI_COMPAT_BASE_URL",
+        PERSONAL_DELEGATE_PROVIDER_BASE_URL,
+    ),
+    ("OPENAI_COMPAT_MODEL", PERSONAL_DELEGATE_PROVIDER_MODEL),
     ("OPENAI_COMPAT_API", "chat"),
-    // Ollama does not authenticate locally, but buzz-agent requires this
-    // syntactically; it is a fixed non-secret sentinel, never a user key.
-    ("OPENAI_COMPAT_API_KEY", "ollama-local-only"),
+    // OPENAI_COMPAT_API_KEY comes exclusively from --provider-key-fd.
     ("BUZZ_AGENT_NO_HINTS", "1"),
     ("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", "1"),
     ("BUZZ_AGENT_MAX_PARALLEL_TOOLS", "1"),
+    ("BUZZ_AGENT_MAX_OUTPUT_TOKENS", "2048"),
+    ("BUZZ_AGENT_MAX_ROUNDS", "8"),
+    ("BUZZ_AGENT_LLM_TIMEOUT_SECS", "120"),
+    ("BUZZ_AGENT_TOOL_TIMEOUT_SECS", "30"),
 ];
 
-fn parse_private_key_fd(value: &str) -> Result<u32, String> {
+/// Shared FD range validation for inherited secret descriptors.
+fn parse_secret_fd(value: &str, flag: &str) -> Result<u32, String> {
     let fd: u32 = value
         .parse()
-        .map_err(|_| "private-key-fd must be a non-negative integer".to_string())?;
-    if !(MIN_PRIVATE_KEY_FD..=MAX_PRIVATE_KEY_FD).contains(&fd) {
+        .map_err(|_| format!("{flag} must be a non-negative integer"))?;
+    if !(MIN_SECRET_FD..=MAX_SECRET_FD).contains(&fd) {
         return Err(format!(
-            "private-key-fd must be between {MIN_PRIVATE_KEY_FD} and {MAX_PRIVATE_KEY_FD} (0/1/2 are reserved)"
+            "{flag} must be between {MIN_SECRET_FD} and {MAX_SECRET_FD} (0/1/2 are reserved)"
         ));
     }
     Ok(fd)
+}
+
+fn parse_private_key_fd(value: &str) -> Result<u32, String> {
+    parse_secret_fd(value, "private-key-fd")
+}
+
+fn parse_provider_key_fd(value: &str) -> Result<u32, String> {
+    parse_secret_fd(value, "provider-key-fd")
 }
 
 fn normalize_expected_pubkey(value: &str) -> Result<String, ConfigError> {
@@ -106,8 +132,16 @@ fn validate_personal_delegate_mcp_command(path: &Path) -> Result<(), ConfigError
     Ok(())
 }
 
+/// Read a secret from an inherited file descriptor with a strict size bound.
+///
+/// Closes the FD after the read. Never includes secret bytes in error messages.
+/// Trims a single trailing newline/CRLF. Rejects empty, oversized, or non-UTF-8.
 #[cfg(unix)]
-fn read_private_key_fd(fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigError> {
+fn read_secret_fd(
+    fd: u32,
+    max_len: usize,
+    label: &str,
+) -> Result<zeroize::Zeroizing<String>, ConfigError> {
     use std::io::Read;
     use zeroize::Zeroize;
 
@@ -120,19 +154,19 @@ fn read_private_key_fd(fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigErro
 
     let _close_original = CloseOnDrop(fd as std::os::fd::RawFd);
     let mut file = std::fs::File::open(format!("/dev/fd/{fd}")).map_err(|_| {
-        ConfigError::ConfigFile("failed to read private key from inherited fd".into())
+        ConfigError::ConfigFile(format!("failed to read {label} from inherited fd"))
     })?;
-    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(PRIVATE_KEY_FD_MAX_LEN + 1));
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(max_len + 1));
     file.by_ref()
-        .take((PRIVATE_KEY_FD_MAX_LEN + 1) as u64)
+        .take((max_len + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| {
-            ConfigError::ConfigFile("failed to read private key from inherited fd".into())
+            ConfigError::ConfigFile(format!("failed to read {label} from inherited fd"))
         })?;
-    if bytes.len() > PRIVATE_KEY_FD_MAX_LEN {
-        return Err(ConfigError::ConfigFile(
-            "private key from inherited fd exceeds maximum length".into(),
-        ));
+    if bytes.len() > max_len {
+        return Err(ConfigError::ConfigFile(format!(
+            "{label} from inherited fd exceeds maximum length"
+        )));
     }
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
@@ -141,17 +175,27 @@ fn read_private_key_fd(fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigErro
         }
     }
     if bytes.is_empty() {
-        return Err(ConfigError::ConfigFile(
-            "private key from inherited fd is empty".into(),
-        ));
+        return Err(ConfigError::ConfigFile(format!(
+            "{label} from inherited fd is empty"
+        )));
     }
     let raw = std::mem::take(&mut *bytes);
     let key = String::from_utf8(raw).map_err(|error| {
         let mut invalid = error.into_bytes();
         invalid.zeroize();
-        ConfigError::ConfigFile("private key from inherited fd is not valid UTF-8".into())
+        ConfigError::ConfigFile(format!("{label} from inherited fd is not valid UTF-8"))
     })?;
     Ok(zeroize::Zeroizing::new(key))
+}
+
+#[cfg(unix)]
+fn read_private_key_fd(fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigError> {
+    read_secret_fd(fd, PRIVATE_KEY_FD_MAX_LEN, "private key")
+}
+
+#[cfg(unix)]
+fn read_provider_key_fd(fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigError> {
+    read_secret_fd(fd, PROVIDER_KEY_FD_MAX_LEN, "provider key")
 }
 
 #[cfg(not(unix))]
@@ -159,6 +203,99 @@ fn read_private_key_fd(_fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigErr
     Err(ConfigError::ConfigFile(
         "--private-key-fd is only supported on Unix".into(),
     ))
+}
+
+#[cfg(not(unix))]
+fn read_provider_key_fd(_fd: u32) -> Result<zeroize::Zeroizing<String>, ConfigError> {
+    Err(ConfigError::ConfigFile(
+        "--provider-key-fd is only supported on Unix".into(),
+    ))
+}
+
+/// Map an HTTP status from the Personal Delegate readiness probe to success/failure.
+///
+/// Separated so unit tests can cover fail-closed behavior without network I/O.
+/// Never includes response bodies (which might echo secrets).
+pub(crate) fn interpret_provider_probe_status(status: u16) -> Result<(), ConfigError> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else if status == 401 || status == 403 {
+        Err(ConfigError::ConfigFile(
+            "Personal Delegate provider readiness probe failed: authentication rejected".into(),
+        ))
+    } else {
+        Err(ConfigError::ConfigFile(format!(
+            "Personal Delegate provider readiness probe failed: HTTP {status}"
+        )))
+    }
+}
+
+/// Prove the exact Personal Delegate cloud model/endpoint is usable with the
+/// FD-delivered API key. No fallback provider or model. Does not log the key
+/// or response body. Does not send user/channel/Paperclip content.
+///
+/// Called at runtime startup (not inside `from_args`) so unit tests that only
+/// exercise config parsing never require network access.
+pub(crate) async fn probe_personal_delegate_provider(api_key: &str) -> Result<(), ConfigError> {
+    probe_personal_delegate_provider_at(
+        PERSONAL_DELEGATE_PROVIDER_BASE_URL,
+        PERSONAL_DELEGATE_PROVIDER_MODEL,
+        api_key,
+        std::time::Duration::from_secs(8),
+    )
+    .await
+}
+
+/// Internal probe entry point with injectable endpoint (for tests against a
+/// local listener). Production always uses the fixed cloud constants.
+pub(crate) async fn probe_personal_delegate_provider_at(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    timeout: std::time::Duration,
+) -> Result<(), ConfigError> {
+    if api_key.is_empty() {
+        return Err(ConfigError::ConfigFile(
+            "Personal Delegate provider readiness probe failed: empty API key".into(),
+        ));
+    }
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| {
+            ConfigError::ConfigFile(
+                "Personal Delegate provider readiness probe failed: HTTP client error".into(),
+            )
+        })?;
+
+    // Smallest safe authenticated completion: no tools, max_tokens=1, fixed
+    // non-sensitive prompt. Proves both auth and model availability.
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    });
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| {
+            // Do not include reqwest Display — it can embed URL query fragments.
+            ConfigError::ConfigFile(
+                "Personal Delegate provider readiness probe failed: network error".into(),
+            )
+        })?;
+
+    let status = response.status().as_u16();
+    // Drain body without logging it (may contain provider diagnostics).
+    let _ = response.bytes().await;
+    interpret_provider_probe_status(status)
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -367,6 +504,14 @@ pub struct CliArgs {
     /// the bounded read. Intended for a launchd/supervisor handoff.
     #[arg(long, value_parser = parse_private_key_fd)]
     pub private_key_fd: Option<u32>,
+
+    /// Read the OpenAI-compat provider API key from an inherited file
+    /// descriptor. Personal-Delegate-only. Unix only; the descriptor is closed
+    /// after the bounded read. The key is injected solely as
+    /// `OPENAI_COMPAT_API_KEY` for the confined buzz-agent child — never into
+    /// MCP children, argv, or logs.
+    #[arg(long, value_parser = parse_provider_key_fd)]
+    pub provider_key_fd: Option<u32>,
 
     /// Expected 64-character hex public key for the supplied private key.
     /// A supervisor uses this to bind a managed identity to this ACP process.
@@ -909,6 +1054,15 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
+        // Distinctness before any FD read — same descriptor cannot carry two secrets.
+        if let (Some(private_fd), Some(provider_fd)) = (args.private_key_fd, args.provider_key_fd) {
+            if private_fd == provider_fd {
+                return Err(ConfigError::ConfigFile(
+                    "private-key-fd and provider-key-fd must be distinct file descriptors".into(),
+                ));
+            }
+        }
+
         let private_key = match args.private_key_fd {
             Some(fd) => read_private_key_fd(fd)?,
             None => zeroize::Zeroizing::new(args.private_key.take().ok_or_else(|| {
@@ -946,6 +1100,20 @@ impl Config {
         }
 
         let personal_delegate_mode = args.personal_delegate_mcp_config.is_some();
+
+        // Provider key FD is Personal-Delegate-only. Require presence (not yet
+        // the read) early so misconfiguration fails closed before relay work.
+        if personal_delegate_mode {
+            if args.provider_key_fd.is_none() {
+                return Err(ConfigError::ConfigFile(
+                    "Personal Delegate mode requires --provider-key-fd".into(),
+                ));
+            }
+        } else if args.provider_key_fd.is_some() {
+            return Err(ConfigError::ConfigFile(
+                "--provider-key-fd is only valid in Personal Delegate mode".into(),
+            ));
+        }
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -1170,16 +1338,29 @@ impl Config {
         let model = args.model;
 
         // Ordinary Codex agents receive the relay-network configuration below.
-        // Personal Delegate instead uses the constrained native-agent route.
+        // Personal Delegate instead uses the constrained native-agent route
+        // (Ollama Cloud + FD-delivered provider key).
         let has_generated_codex_config = if personal_delegate_mode {
             // Do not use the general Codex relay-network widening here. The
             // native buzz-agent has only MCP tools, and this fixed provider
-            // environment confines model traffic to loopback Ollama.
+            // environment confines model traffic to Ollama Cloud.
             persona_env_vars.extend(
                 PERSONAL_DELEGATE_AGENT_ENV
                     .iter()
                     .map(|(key, value)| ((*key).into(), (*value).into())),
             );
+            // Provider credential: only from --provider-key-fd. Never from
+            // PERSONAL_DELEGATE_AGENT_ENV fixed constants, argv, or ambient env.
+            let provider_fd = args.provider_key_fd.ok_or_else(|| {
+                ConfigError::ConfigFile("Personal Delegate mode requires --provider-key-fd".into())
+            })?;
+            let provider_key = read_provider_key_fd(provider_fd)?;
+            persona_env_vars.push((
+                "OPENAI_COMPAT_API_KEY".to_string(),
+                provider_key.as_str().to_string(),
+            ));
+            // provider_key Zeroizing drops here — the String copy lives only in
+            // persona_env_vars for the confined agent child spawn.
             false
         } else if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
             persona_env_vars.push(network_env);
@@ -1640,6 +1821,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_key_fd_rejects_standard_streams_and_accepts_inherited_fd_range() {
+        assert!(parse_provider_key_fd("0").is_err());
+        assert!(parse_provider_key_fd("1").is_err());
+        assert!(parse_provider_key_fd("2").is_err());
+        assert!(parse_provider_key_fd("1025").is_err());
+        assert!(parse_provider_key_fd("not-a-number").is_err());
+        assert_eq!(parse_provider_key_fd("3").unwrap(), 3);
+        assert_eq!(parse_provider_key_fd("4").unwrap(), 4);
+        assert_eq!(parse_provider_key_fd("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn interpret_provider_probe_status_fail_closed() {
+        assert!(interpret_provider_probe_status(200).is_ok());
+        assert!(interpret_provider_probe_status(201).is_ok());
+        assert!(interpret_provider_probe_status(401)
+            .unwrap_err()
+            .to_string()
+            .contains("authentication rejected"));
+        assert!(interpret_provider_probe_status(403)
+            .unwrap_err()
+            .to_string()
+            .contains("authentication rejected"));
+        assert!(interpret_provider_probe_status(404)
+            .unwrap_err()
+            .to_string()
+            .contains("HTTP 404"));
+        assert!(interpret_provider_probe_status(500)
+            .unwrap_err()
+            .to_string()
+            .contains("HTTP 500"));
+    }
+
+    /// Write `secret` into a pipe and return the read-end FD number.
+    /// Ownership of the FD is transferred to the caller (who must close it,
+    /// typically via `read_*_key_fd`).
+    #[cfg(unix)]
+    fn pipe_with_secret(secret: &[u8]) -> u32 {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(secret).expect("write secret");
+        drop(writer);
+        reader.into_raw_fd() as u32
+    }
+
+    #[test]
     fn expected_pubkey_accepts_matching_key_after_normalization() {
         use nostr::ToBech32;
 
@@ -1742,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn personal_delegate_mode_requires_native_runtime_and_emits_loopback_configuration() {
+    fn personal_delegate_mode_requires_provider_key_fd() {
         use nostr::ToBech32;
 
         let nsec = Keys::generate().secret_key().to_bech32().unwrap();
@@ -1759,6 +1988,86 @@ mod tests {
         ])
         .unwrap();
 
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert!(
+            error.contains("requires --provider-key-fd"),
+            "missing provider-key-fd must fail closed: {error}"
+        );
+    }
+
+    #[test]
+    fn non_personal_delegate_mode_rejects_provider_key_fd() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "goose",
+            "--provider-key-fd",
+            "4",
+        ])
+        .unwrap();
+
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert!(
+            error.contains("only valid in Personal Delegate mode"),
+            "provider-key-fd outside PD mode must be rejected: {error}"
+        );
+    }
+
+    #[test]
+    fn provider_key_fd_and_private_key_fd_must_be_distinct() {
+        // Clap accepts the flags; from_args rejects equal FDs before any read.
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key-fd",
+            "3",
+            "--provider-key-fd",
+            "3",
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+        ])
+        .unwrap();
+
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert!(
+            error.contains("must be distinct"),
+            "identical secret FDs must be rejected: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personal_delegate_mode_requires_native_runtime_and_emits_cloud_configuration() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        // Sentinel test value — never a production key.
+        const TEST_PROVIDER_KEY: &str = "test-ollama-cloud-key-sentinel";
+        let provider_fd = pipe_with_secret(format!("{TEST_PROVIDER_KEY}\n").as_bytes());
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+        ])
+        .unwrap();
+
         let config = Config::from_args(args).unwrap();
         assert!(config.personal_delegate_mode);
         assert!(config.mcp_command.is_empty());
@@ -1766,26 +2075,150 @@ mod tests {
         assert_eq!(
             config.persona_env_vars,
             vec![
-                ("BUZZ_AGENT_PROVIDER".to_string(), "openai".to_string(),),
+                ("BUZZ_AGENT_PROVIDER".to_string(), "openai".to_string()),
                 (
                     "OPENAI_COMPAT_BASE_URL".to_string(),
-                    "http://127.0.0.1:11434/v1".to_string(),
+                    "https://ollama.com/v1".to_string(),
                 ),
-                ("OPENAI_COMPAT_MODEL".to_string(), "llama3.1:8b".to_string()),
-                ("OPENAI_COMPAT_API".to_string(), "chat".to_string()),
                 (
-                    "OPENAI_COMPAT_API_KEY".to_string(),
-                    "ollama-local-only".to_string(),
+                    "OPENAI_COMPAT_MODEL".to_string(),
+                    "kimi-k2.7-code".to_string(),
                 ),
+                ("OPENAI_COMPAT_API".to_string(), "chat".to_string()),
                 ("BUZZ_AGENT_NO_HINTS".to_string(), "1".to_string()),
                 (
                     "BUZZ_AGENT_PERSONAL_DELEGATE_MODE".to_string(),
                     "1".to_string(),
                 ),
-                ("BUZZ_AGENT_MAX_PARALLEL_TOOLS".to_string(), "1".to_string(),),
+                ("BUZZ_AGENT_MAX_PARALLEL_TOOLS".to_string(), "1".to_string()),
+                (
+                    "BUZZ_AGENT_MAX_OUTPUT_TOKENS".to_string(),
+                    "2048".to_string()
+                ),
+                ("BUZZ_AGENT_MAX_ROUNDS".to_string(), "8".to_string()),
+                ("BUZZ_AGENT_LLM_TIMEOUT_SECS".to_string(), "120".to_string()),
+                ("BUZZ_AGENT_TOOL_TIMEOUT_SECS".to_string(), "30".to_string()),
+                (
+                    "OPENAI_COMPAT_API_KEY".to_string(),
+                    TEST_PROVIDER_KEY.to_string(),
+                ),
             ]
         );
         assert!(!config.has_generated_codex_config);
+        // Key delivered only via persona_env_vars (agent child), never as argv.
+        assert!(
+            !std::env::args().any(|a| a.contains(TEST_PROVIDER_KEY)),
+            "provider key must not appear in process argv"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_key_fd_rejects_empty_secret() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let provider_fd = pipe_with_secret(b"");
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+        ])
+        .unwrap();
+
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert!(
+            error.contains("provider key from inherited fd is empty"),
+            "empty provider key must fail closed: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_key_fd_rejects_oversized_secret() {
+        use nostr::ToBech32;
+
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        let oversized = vec![b'a'; PROVIDER_KEY_FD_MAX_LEN + 1];
+        let provider_fd = pipe_with_secret(&oversized);
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            nsec.as_str(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+        ])
+        .unwrap();
+
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert!(
+            error.contains("exceeds maximum length"),
+            "oversized provider key must fail closed: {error}"
+        );
+        // Error must not echo the secret payload.
+        assert!(!error.contains(&"a".repeat(32)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_private_key_fd_still_works_alongside_provider_key_fd() {
+        use nostr::ToBech32;
+        use std::os::fd::IntoRawFd;
+
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let private_fd = {
+            use std::io::Write;
+            let (reader, mut writer) = std::io::pipe().expect("pipe");
+            writer.write_all(nsec.as_bytes()).expect("write nsec");
+            drop(writer);
+            reader.into_raw_fd() as u32
+        };
+        const TEST_PROVIDER_KEY: &str = "test-provider-alongside-private";
+        let provider_fd = pipe_with_secret(TEST_PROVIDER_KEY.as_bytes());
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key-fd",
+            &private_fd.to_string(),
+            "--provider-key-fd",
+            &provider_fd.to_string(),
+            "--agent-command",
+            "/opt/pinned/buzz-agent",
+            "--personal-delegate-mcp-config",
+            "/opt/personal-delegate/config.json",
+            "--personal-delegate-mcp-command",
+            "/opt/personal-delegate/personal-delegate-mcp",
+            "--expected-pubkey",
+            &keys.public_key().to_hex(),
+        ])
+        .unwrap();
+
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.keys.public_key(), keys.public_key());
+        assert!(
+            config
+                .persona_env_vars
+                .iter()
+                .any(|(k, v)| k == "OPENAI_COMPAT_API_KEY" && v == TEST_PROVIDER_KEY),
+            "provider key from fd must land in persona_env_vars"
+        );
     }
 
     #[test]
@@ -1803,6 +2236,8 @@ mod tests {
             "/opt/personal-delegate/config.json",
             "--personal-delegate-mcp-command",
             "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            "4",
         ])
         .unwrap();
         assert!(Config::from_args(args)
@@ -1820,6 +2255,8 @@ mod tests {
             "/opt/personal-delegate/config.json",
             "--personal-delegate-mcp-command",
             "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            "4",
         ])
         .unwrap();
         assert!(
@@ -1842,6 +2279,8 @@ mod tests {
             "/opt/personal-delegate/config.json",
             "--personal-delegate-mcp-command",
             "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            "4",
         ])
         .unwrap();
         assert!(Config::from_args(args)
@@ -1866,6 +2305,8 @@ mod tests {
             "/opt/personal-delegate/config.json",
             "--personal-delegate-mcp-command",
             "/opt/personal-delegate/personal-delegate-mcp",
+            "--provider-key-fd",
+            "4",
         ])
         .unwrap();
         assert!(Config::from_args(args)
@@ -1889,7 +2330,7 @@ mod tests {
     }
 
     #[test]
-    fn personal_delegate_fixed_env_disables_hints_and_binds_local_ollama_only() {
+    fn personal_delegate_fixed_env_binds_ollama_cloud_without_api_key_constant() {
         assert!(PERSONAL_DELEGATE_AGENT_ENV
             .iter()
             .any(|(k, v)| *k == "BUZZ_AGENT_NO_HINTS" && *v == "1"));
@@ -1898,13 +2339,36 @@ mod tests {
             .any(|(k, v)| *k == "BUZZ_AGENT_PERSONAL_DELEGATE_MODE" && *v == "1"));
         assert!(PERSONAL_DELEGATE_AGENT_ENV
             .iter()
-            .any(|(k, v)| { *k == "OPENAI_COMPAT_BASE_URL" && *v == "http://127.0.0.1:11434/v1" }));
+            .any(|(k, v)| { *k == "OPENAI_COMPAT_BASE_URL" && *v == "https://ollama.com/v1" }));
         assert!(PERSONAL_DELEGATE_AGENT_ENV
             .iter()
-            .any(|(k, v)| *k == "OPENAI_COMPAT_MODEL" && *v == "llama3.1:8b"));
+            .any(|(k, v)| *k == "OPENAI_COMPAT_MODEL" && *v == "kimi-k2.7-code"));
         assert!(PERSONAL_DELEGATE_AGENT_ENV
             .iter()
-            .any(|(k, v)| *k == "OPENAI_COMPAT_API_KEY" && *v == "ollama-local-only"));
+            .any(|(k, v)| *k == "OPENAI_COMPAT_API" && *v == "chat"));
+        // API key must never be a fixed constant — only from --provider-key-fd.
+        assert!(
+            PERSONAL_DELEGATE_AGENT_ENV
+                .iter()
+                .all(|(k, _)| *k != "OPENAI_COMPAT_API_KEY"),
+            "OPENAI_COMPAT_API_KEY must not appear in PERSONAL_DELEGATE_AGENT_ENV"
+        );
+        // No local llama pin.
+        assert!(PERSONAL_DELEGATE_AGENT_ENV.iter().all(|(_, v)| {
+            !v.contains("llama3.1") && !v.contains("127.0.0.1:11434") && *v != "ollama-local-only"
+        }));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| { *k == "BUZZ_AGENT_MAX_OUTPUT_TOKENS" && *v == "2048" }));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| *k == "BUZZ_AGENT_MAX_ROUNDS" && *v == "8"));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| { *k == "BUZZ_AGENT_LLM_TIMEOUT_SECS" && *v == "120" }));
+        assert!(PERSONAL_DELEGATE_AGENT_ENV
+            .iter()
+            .any(|(k, v)| { *k == "BUZZ_AGENT_TOOL_TIMEOUT_SECS" && *v == "30" }));
         assert!(PERSONAL_DELEGATE_AGENT_ENV
             .iter()
             .all(|(k, _)| *k != "CODEX_CONFIG"

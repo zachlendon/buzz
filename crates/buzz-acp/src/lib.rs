@@ -1226,6 +1226,31 @@ async fn tokio_main() -> Result<()> {
         return setup_mode::run_setup_listener(config, payload).await;
     }
 
+    // Personal Delegate: prove the exact Ollama Cloud model is reachable with
+    // the FD-delivered key before accepting any relay work. No fallback model.
+    // Does not log the key or response body.
+    if config.personal_delegate_mode {
+        let api_key = config
+            .persona_env_vars
+            .iter()
+            .find(|(k, _)| k == "OPENAI_COMPAT_API_KEY")
+            .map(|(_, v)| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Personal Delegate mode missing OPENAI_COMPAT_API_KEY in persona env \
+                     (expected from --provider-key-fd)"
+                )
+            })?;
+        config::probe_personal_delegate_provider(api_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tracing::info!(
+            endpoint = config::PERSONAL_DELEGATE_PROVIDER_BASE_URL,
+            model = config::PERSONAL_DELEGATE_PROVIDER_MODEL,
+            "Personal Delegate provider readiness probe passed"
+        );
+    }
+
     tracing::info!("buzz-acp starting: {}", config.summary());
 
     let observer = config
@@ -1567,6 +1592,9 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         publish_assistant_messages: config.publish_assistant_messages,
+        published_trigger_ids: std::sync::Arc::new(std::sync::Mutex::new(
+            pool::PublishedTriggerSet::with_capacity(pool::PUBLISHED_TRIGGER_SET_CAPACITY),
+        )),
     });
 
     if !config.memory_enabled {

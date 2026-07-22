@@ -1025,6 +1025,30 @@ mod content_tests {
     fn passthrough_includes_buzz_owner_attestation() {
         assert!(PASSTHROUGH_ENV.contains(&"BUZZ_AUTH_TAG"));
     }
+
+    #[test]
+    fn passthrough_excludes_openai_compat_and_provider_credentials() {
+        // MCP children get env_clear() then only PASSTHROUGH_ENV. Provider
+        // credentials held by the confined buzz-agent parent must never pass
+        // through to MCP (Personal Delegate security boundary).
+        for forbidden in [
+            "OPENAI_COMPAT_API_KEY",
+            "OPENAI_COMPAT_BASE_URL",
+            "OPENAI_COMPAT_MODEL",
+            "OPENAI_COMPAT_API",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "DATABRICKS_TOKEN",
+            "CODEX_API_KEY",
+            "BUZZ_AGENT_PROVIDER",
+            "BUZZ_AGENT_PERSONAL_DELEGATE_MODE",
+        ] {
+            assert!(
+                !PASSTHROUGH_ENV.contains(&forbidden),
+                "{forbidden} must not be in PASSTHROUGH_ENV (MCP isolation)"
+            );
+        }
+    }
     use rmcp::model::Content;
 
     #[cfg(windows)]
@@ -1214,5 +1238,85 @@ mod content_tests {
             Some(value) => std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", value),
             None => std::env::remove_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE"),
         }
+    }
+
+    /// Prove MCP child env construction never inherits `OPENAI_COMPAT_API_KEY`
+    /// even when the parent agent process holds it (Personal Delegate boundary).
+    /// Mirrors `spawn_one()`: env_clear + PASSTHROUGH_ENV only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_child_env_clear_blocks_provider_api_key() {
+        use std::process::Stdio;
+        use std::sync::OnceLock;
+        use tokio::io::AsyncReadExt;
+        use tokio::process::Command;
+        use tokio::sync::Mutex;
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
+        const SENTINEL_KEY: &str = "test-provider-key-must-not-reach-mcp";
+        let prior_pd = std::env::var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE").ok();
+        let prior_key = std::env::var("OPENAI_COMPAT_API_KEY").ok();
+        let prior_base = std::env::var("OPENAI_COMPAT_BASE_URL").ok();
+
+        std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", "1");
+        std::env::set_var("OPENAI_COMPAT_API_KEY", SENTINEL_KEY);
+        std::env::set_var("OPENAI_COMPAT_BASE_URL", "https://ollama.com/v1");
+
+        // Same construction as spawn_one: clear, then only PASSTHROUGH_ENV.
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg("env | cut -d= -f1 | sort")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd.env_clear();
+        for k in super::PASSTHROUGH_ENV {
+            if let Ok(v) = std::env::var(k) {
+                cmd.env(k, v);
+            }
+        }
+
+        let mut child = cmd.spawn().expect("spawn env-name probe");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let mut names = String::new();
+        stdout
+            .read_to_string(&mut names)
+            .await
+            .expect("read env names");
+        let status = child.wait().await.expect("wait");
+        assert!(status.success(), "env probe must exit 0");
+
+        match prior_pd {
+            Some(value) => std::env::set_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE", value),
+            None => std::env::remove_var("BUZZ_AGENT_PERSONAL_DELEGATE_MODE"),
+        }
+        match prior_key {
+            Some(value) => std::env::set_var("OPENAI_COMPAT_API_KEY", value),
+            None => std::env::remove_var("OPENAI_COMPAT_API_KEY"),
+        }
+        match prior_base {
+            Some(value) => std::env::set_var("OPENAI_COMPAT_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_COMPAT_BASE_URL"),
+        }
+
+        let name_set: std::collections::HashSet<&str> = names.lines().collect();
+        assert!(
+            !name_set.contains("OPENAI_COMPAT_API_KEY"),
+            "MCP child must not receive OPENAI_COMPAT_API_KEY; names={names}"
+        );
+        assert!(
+            !name_set.contains("OPENAI_COMPAT_BASE_URL"),
+            "MCP child must not receive OPENAI_COMPAT_BASE_URL; names={names}"
+        );
+        assert!(
+            !name_set.contains("BUZZ_AGENT_PERSONAL_DELEGATE_MODE"),
+            "MCP child must not receive BUZZ_AGENT_PERSONAL_DELEGATE_MODE; names={names}"
+        );
+        // Values must never appear either (belt-and-suspenders).
+        assert!(
+            !names.contains(SENTINEL_KEY),
+            "provider key value must not leak into env-name dump"
+        );
     }
 }

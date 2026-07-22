@@ -980,6 +980,16 @@ pub enum ConversationContext {
         total: usize,
         truncated: bool,
     },
+    /// Recent top-level channel messages (not a thread reply, not a DM).
+    ///
+    /// Used so references like "the request above" resolve when the triggering
+    /// event alone is a short follow-up. Triggering batch events are excluded
+    /// from these messages to avoid duplicating the `[Event]` section.
+    Channel {
+        messages: Vec<ContextMessage>,
+        total: usize,
+        truncated: bool,
+    },
 }
 
 /// A single message in a conversation context section.
@@ -1300,11 +1310,22 @@ fn format_context_hints(
         }
         s
     } else {
+        // Top-level channel: prefer included recent history over CLI fetch
+        // hints. Personal Delegate runs without buzz CLI credentials, so
+        // `buzz messages get` is not actionable there.
+        let ctx_hint = if has_conversation_context {
+            "Recent channel messages are included below. References like \
+             \"the request above\" or \"above\" mean the immediately preceding \
+             owner request in that context — not a summary of arbitrary history."
+        } else {
+            "Recent channel history was not available for this turn. Work only \
+             from the event content below."
+        };
         let mut s = format!(
             "[Context]\n\
              Scope: channel\n\
              Channel: {channel_display}\n\
-             Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed."
+             {ctx_hint}"
         );
         if let Some(event_id) = reply_anchor {
             append_new_thread_reply_instruction(&mut s, event_id);
@@ -1313,7 +1334,7 @@ fn format_context_hints(
     }
 }
 
-/// Format a conversation context section (thread or DM).
+/// Format a conversation context section (thread, DM, or channel).
 fn format_conversation_context(
     ctx: &ConversationContext,
     profile_lookup: Option<&PromptProfileLookup>,
@@ -1329,6 +1350,11 @@ fn format_conversation_context(
             total,
             truncated,
         } => ("Conversation Context", messages, total, truncated),
+        ConversationContext::Channel {
+            messages,
+            total,
+            truncated,
+        } => ("Channel Context", messages, total, truncated),
     };
 
     let trunc_label = if *truncated { ", truncated" } else { "" };
@@ -1390,7 +1416,7 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
 /// 2. `[Agent Memory — core]` — if agent core memory is set
 /// 3. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
+/// 4. `[Thread Context]`, `[Conversation Context]`, or `[Channel Context]` — if fetched
 /// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
@@ -2988,6 +3014,82 @@ mod tests {
         .join("\n\n");
         assert!(prompt.contains("engineering (#"));
         assert!(prompt.contains("Scope: channel"));
+        // Without fetched context: no buzz CLI fetch hint (Personal Delegate has no CLI).
+        assert!(
+            !prompt.contains("buzz messages get"),
+            "top-level channel must not instruct buzz CLI fetch, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Recent channel history was not available"),
+            "absent channel context should say history was unavailable, got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_channel_context_includes_prior_request_above() {
+        let ch = Uuid::new_v4();
+        let long_prior = "Please run a read-only pilot: look up organization \
+            ACME Corp, list open attention items for Q3 planning, and summarize \
+            findings with source citations. No Paperclip writes and no Slack.";
+        let event = make_event(
+            "@Personal Delegate Please perform the read-only pilot request above now. \
+             No Paperclip writes and no Slack.",
+        );
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let ci = PromptChannelInfo {
+            name: "general".into(),
+            channel_type: "stream".into(),
+        };
+        let ctx = ConversationContext::Channel {
+            messages: vec![ContextMessage {
+                pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-22T12:00:00Z".into(),
+                content: long_prior.into(),
+            }],
+            total: 1,
+            truncated: false,
+        };
+
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                channel_info: Some(&ci),
+                conversation_context: Some(&ctx),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(prompt.contains("Scope: channel"));
+        assert!(
+            prompt.contains("[Channel Context"),
+            "must label channel history as Channel Context, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains(long_prior),
+            "prior long request must appear in prompt so 'request above' resolves, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("request above"),
+            "triggering short event content must still appear"
+        );
+        assert!(
+            prompt.contains("immediately preceding owner request"),
+            "context hints must explain 'request above' resolution, got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("buzz messages get"),
+            "with included channel context, must not point at buzz CLI"
+        );
     }
 
     #[test]
