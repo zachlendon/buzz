@@ -708,7 +708,7 @@ release-desktop *ARGS:
     fi
     just _release-pr desktop "$VERSION"
 
-# Open or update the relay release PR (ghcr.io/block/buzz image)
+# Open or update the relay release PR (ghcr.io/zachlendon/buzz image)
 release-relay *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail

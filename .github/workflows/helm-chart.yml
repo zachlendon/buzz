@@ -105,7 +105,7 @@ jobs:
           done
 
   install-on-kind:
-    # Full end-to-end install requires the public ghcr.io/block/buzz image to
+    # Full end-to-end install requires the public ghcr.io/zachlendon/buzz image to
     # exist and to embed Max's startup migrations. Runs only after Sami's
     # image PR merges (`workflow_dispatch`) or on a schedule once main carries
     # both prerequisites. Render/lint above is the per-PR signal.

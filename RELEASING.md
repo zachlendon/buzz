@@ -6,7 +6,7 @@ ever pushes a git tag:
 | Lane | Recipe | Artifact |
 |------|--------|----------|
 | Desktop | `just release-desktop` | Signed desktop app (macOS/Linux) |
-| Relay | `just release-relay` | `ghcr.io/block/buzz` container image |
+| Relay | `just release-relay` | `ghcr.io/zachlendon/buzz` container image |
 | Mobile | `just release-mobile` | Buzz mobile app (tag is the `sprout_ref` for the internal build) |
 
 The three lanes version independently: the desktop version lives in
@@ -86,7 +86,7 @@ deleting them. The workflow's default `GITHUB_TOKEN` is read-only.
    `relay-release/*` branch merge and pushes a `relay-v<version>` tag.
 3. **Tag triggers `docker.yml`** — the `relay-v<version>` push triggers
    `docker.yml`, which builds the multi-arch relay
-   image and publishes `ghcr.io/block/buzz:<version>` (plus `:<major>.<minor>`,
+   image and publishes `ghcr.io/zachlendon/buzz:<version>` (plus `:<major>.<minor>`,
    `:<major>`, and `:latest` for stable releases). Prereleases
    (`relay-v<version>-rc.1`) publish only the prerelease tag and do **not**
    move `:latest`. GitHub runs the tag trigger because the tag is created by
