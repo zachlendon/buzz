@@ -204,6 +204,7 @@ fn read_key_from_fd(_fd: u32) -> Result<zeroize::Zeroizing<String>, CliError> {
 /// out so it can be exercised in tests against a synthetic [`std::io::Read`]
 /// that fails mid-read — something a real fd can't easily simulate.
 /// `fd` is used only for error-message context, not for any I/O here.
+#[cfg(any(unix, test))]
 fn read_key_from_reader<R: std::io::Read>(
     mut reader: R,
     fd: u32,
