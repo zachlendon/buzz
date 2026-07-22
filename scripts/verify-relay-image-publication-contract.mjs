@@ -15,6 +15,16 @@ const IMAGE_EXPRESSION =
 const REPOSITORY_OWNER = "${{ github.repository_owner }}";
 const GITHUB_TOKEN = "${{ secrets.GITHUB_TOKEN }}";
 const GATEWAY_JOBS = new Set(["push-gateway-build", "push-gateway-merge"]);
+const PROVENANCE_PERMISSIONS = {
+  contents: "read",
+  packages: "write",
+  "id-token": "write",
+  attestations: "write",
+};
+const GATEWAY_BUILD_PERMISSIONS = {
+  contents: "read",
+  packages: "write",
+};
 
 const BUILD_STEP_NAMES = [
   "Checkout",
@@ -373,6 +383,11 @@ function validateWorkflowUpstreamTargets(ast, label, locationFamily) {
 function validateDockerWorkflow(source) {
   const { ast, value: workflow } = parseYamlDocument(source, WORKFLOW);
   assert.deepEqual(
+    workflow.permissions,
+    {},
+    "workflow permissions must default to none",
+  );
+  assert.deepEqual(
     workflow.on.push.branches,
     ["main"],
     "Docker push branches must be exactly main",
@@ -411,8 +426,26 @@ function validateDockerWorkflow(source) {
     MERGE_STEP_NAMES,
   );
   assert.equal(merge.needs, "build", "manifest job must depend on relay build");
-  assert.equal(build.permissions.packages, "write");
-  assert.equal(merge.permissions.packages, "write");
+  assert.deepEqual(
+    build.permissions,
+    PROVENANCE_PERMISSIONS,
+    "relay build permissions changed",
+  );
+  assert.deepEqual(
+    merge.permissions,
+    PROVENANCE_PERMISSIONS,
+    "relay merge permissions changed",
+  );
+  assert.deepEqual(
+    workflow.jobs["push-gateway-build"].permissions,
+    GATEWAY_BUILD_PERMISSIONS,
+    "push-gateway build permissions changed",
+  );
+  assert.deepEqual(
+    workflow.jobs["push-gateway-merge"].permissions,
+    PROVENANCE_PERMISSIONS,
+    "push-gateway merge permissions changed",
+  );
   validateConditions(build, merge);
   validateLogin(build, "build");
   validateLogin(merge, "merge");
