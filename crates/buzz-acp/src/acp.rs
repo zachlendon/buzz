@@ -302,15 +302,17 @@ pub struct AcpClient {
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
     /// Concatenated `agent_message_chunk` text for the current prompt attempt.
-    /// Cleared at the start of each `session_prompt_blocks_with_idle_timeout`.
-    /// Taken on terminal completion when `publish_assistant_messages` is
-    /// enabled (Personal Delegate path). Always bounded by
-    /// [`ASSISTANT_MESSAGE_MAX_BYTES`] so default-off cannot OOM.
+    /// Cleared at the start of each `session_prompt_blocks_with_idle_timeout`
+    /// and on every structured `tool_call` session/update so published content
+    /// is only text after the last tool round. Taken on terminal completion when
+    /// `publish_assistant_messages` is enabled (Personal Delegate path). Always
+    /// bounded by [`ASSISTANT_MESSAGE_MAX_BYTES`] so default-off cannot OOM.
     /// Thoughts, tool payloads, and observer frames are never collected here.
     assistant_message: String,
     /// Set when an `agent_message_chunk` would exceed
-    /// [`ASSISTANT_MESSAGE_MAX_BYTES`]. Cleared with the buffer at prompt start
-    /// and on [`take_assistant_message`]. Overflow text is never published.
+    /// [`ASSISTANT_MESSAGE_MAX_BYTES`]. Cleared with the buffer at prompt start,
+    /// on structured `tool_call`, and on [`take_assistant_message`]. Overflow
+    /// text is never published.
     assistant_message_overflow: bool,
 }
 
@@ -1730,6 +1732,13 @@ impl AcpClient {
                 false
             }
             "tool_call" => {
+                // Discard pre-tool narration so publish captures only text after
+                // the last structured tool call (not concatenated tool-round
+                // chatter + terminal answer). Reset overflow too so a prior
+                // over-cap chunk cannot poison the post-tool final answer.
+                self.assistant_message.clear();
+                self.assistant_message_overflow = false;
+
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -3820,6 +3829,115 @@ printf 'BUZZ_AGENT_PERSONAL_DELEGATE_MODE=%s\n' "${BUZZ_AGENT_PERSONAL_DELEGATE_
                 },
             }
         })
+    }
+
+    /// Build a structured `tool_call` session/update (title/kind only).
+    fn tool_call_update_msg(title: &str, kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": title,
+                    "kind": kind,
+                },
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn tool_call_discards_pre_tool_assistant_text() {
+        let mut client = spawn_inert_client().await;
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "I will look that up…",
+        ));
+        let resets_idle = client.handle_session_update(&tool_call_update_msg("search", "search"));
+        assert!(resets_idle, "tool_call must still signal idle reset");
+        let taken = client.take_assistant_message();
+        assert!(
+            taken.text.is_empty(),
+            "pre-tool assistant text must be discarded on tool_call"
+        );
+        assert!(!taken.overflow);
+    }
+
+    #[tokio::test]
+    async fn tool_call_resets_overflow_state() {
+        let mut client = spawn_inert_client().await;
+        let over_cap = "o".repeat(ASSISTANT_MESSAGE_MAX_BYTES + 32);
+        let _ =
+            client.handle_session_update(&agent_chunk_update_msg("agent_message_chunk", &over_cap));
+        assert!(
+            client.assistant_message_overflow,
+            "precondition: capture must be overflowed"
+        );
+        let _ = client.handle_session_update(&tool_call_update_msg("run", "shell"));
+        assert!(
+            !client.assistant_message_overflow,
+            "tool_call must clear overflow so post-tool text can be captured"
+        );
+        assert!(
+            client.assistant_message.is_empty(),
+            "tool_call must clear the overflowed buffer"
+        );
+        // Post-tool text must be capturable without inheriting the prior overflow.
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "answer after tool",
+        ));
+        let taken = client.take_assistant_message();
+        assert_eq!(taken.text, "answer after tool");
+        assert!(!taken.overflow);
+    }
+
+    #[tokio::test]
+    async fn tool_call_retains_only_post_tool_final_text() {
+        let mut client = spawn_inert_client().await;
+        let _ = client
+            .handle_session_update(&agent_chunk_update_msg("agent_message_chunk", "pre-tool "));
+        let _ = client.handle_session_update(&tool_call_update_msg("read_file", "read"));
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "Here is the answer.",
+        ));
+        let taken = client.take_assistant_message();
+        assert_eq!(taken.text, "Here is the answer.");
+        assert!(!taken.overflow);
+        assert!(
+            !taken.text.contains("pre-tool"),
+            "must not concatenate pre-tool narration with the final answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_and_thoughts_never_captured_as_assistant_text() {
+        let mut client = spawn_inert_client().await;
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_thought_chunk",
+            "secret thought about tools",
+        ));
+        let _ = client.handle_session_update(&tool_call_update_msg(
+            "should-not-appear-in-capture",
+            "execute",
+        ));
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_thought_chunk",
+            "more thinking after tool",
+        ));
+        // Only structured message chunks are captured.
+        let _ = client.handle_session_update(&agent_chunk_update_msg(
+            "agent_message_chunk",
+            "visible final",
+        ));
+        let taken = client.take_assistant_message();
+        assert_eq!(taken.text, "visible final");
+        assert!(!taken.overflow);
+        assert!(!taken.text.contains("thought"));
+        assert!(!taken.text.contains("should-not-appear"));
+        assert!(!taken.text.contains("thinking"));
     }
 
     #[tokio::test]
