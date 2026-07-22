@@ -249,7 +249,6 @@ jobs:
         id: manifest
         working-directory: /tmp/digests
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
@@ -284,7 +283,6 @@ jobs:
 
       - name: Summary
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
           MERGED_DIGEST: ${{ steps.manifest.outputs.digest }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |

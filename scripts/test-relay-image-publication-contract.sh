@@ -38,6 +38,7 @@ check_contract() {
   local dockerfile="$root/Dockerfile"
   local relay_manifest="$root/crates/buzz-relay/Cargo.toml"
   local trigger_block relay_workflow build_job merge_job gateway_build gateway_merge
+  local image_name_definitions
   contract_failed=0
 
   trigger_block=$(awk '/^on:/{capture=1} /^# One image build/{exit} capture' "$workflow")
@@ -52,7 +53,17 @@ check_contract() {
   [[ $(grep -Ec '^    branches:' <<<"$trigger_block" || true) == 1 ]] || \
     fail 'docker publisher has an additional branch push trigger'
 
-  require_block_line "$relay_workflow" \
+  # Count YAML mapping keys across the entire workflow, including inline maps.
+  # Comments do not define keys. Any second key would shadow the workflow-level
+  # publication target at a job or step scope, even if it repeated the value.
+  image_name_definitions=$(perl -ne '
+    next if /^\s*#/;
+    $count += () = /(?:^|[,{\s])IMAGE_NAME\s*:/g;
+    END { print $count // 0 }
+  ' "$workflow")
+  [[ "$image_name_definitions" == 1 ]] || \
+    fail "docker workflow must define IMAGE_NAME exactly once (found $image_name_definitions)"
+  require_line "$workflow" \
     "  IMAGE_NAME: \${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/zachlendon/buzz' }}" \
     'relay publisher must retain GHCR_IMAGE override and default to the fork package'
   if grep -Fq "github.repository == 'block/buzz'" <<<"$relay_workflow"; then
@@ -137,16 +148,32 @@ check_contract() {
   require_line "$ci" '        run: scripts/test-relay-image-publication-contract.sh' \
     'CI must execute the relay publication contract'
 
-  # A slash denotes the separately published upstream chart namespace and a
-  # hyphen denotes the separately scoped push-gateway package. All other
-  # upstream relay-image references must be historical changelog entries or
-  # this fail-closed checker naming the forbidden value.
+  # Classify every occurrence by its suffix rather than guessing which
+  # punctuation may delimit an unsuffixed image. The only active upstream
+  # package families retained by this fork are /charts and -push-gateway
+  # (including its build cache). Historical changelogs and this checker's
+  # mutation fixtures are explicit reference-only exclusions.
   local upstream_matches
-  upstream_matches=$(grep -REn \
-    --exclude-dir=.git \
-    --exclude='*CHANGELOG.md' \
-    --exclude='test-relay-image-publication-contract.sh' \
-    'ghcr\.io/block/buzz([:@[:space:]]|$)' "$root" || true)
+  upstream_matches=$(
+    {
+      grep -IRnF \
+        --exclude-dir=.git \
+        --exclude='*CHANGELOG.md' \
+        --exclude='test-relay-image-publication-contract.sh' \
+        'ghcr.io/block/buzz' "$root" || true
+    } | perl -ne '
+      $needle = "ghcr.io/block/buzz";
+      $offset = 0;
+      while (($index = index($_, $needle, $offset)) >= 0) {
+        $tail = substr($_, $index + length($needle));
+        unless ($tail =~ m{\A(?:/charts(?:[^\w-]|$)|-push-gateway(?:-buildcache)?(?:[^\w-]|$))}) {
+          print;
+          last;
+        }
+        $offset = $index + length($needle);
+      }
+    '
+  )
   [[ -z "$upstream_matches" ]] || {
     printf '%s\n' "$upstream_matches" >&2
     fail 'an active relay surface still references the upstream image'
@@ -192,6 +219,7 @@ fixture_files=(
   .github/workflows/ci.yml
   .github/workflows/docker.yml
   .github/workflows/helm-chart.yml
+  .github/CODEOWNERS
   Dockerfile
   Justfile
   RELEASING.md
@@ -209,6 +237,12 @@ done
 
 run_negative_probe "$fixture_base" main-trigger .github/workflows/docker.yml \
   '    branches: [main]' '    branches: [main, release]'
+run_negative_probe "$fixture_base" alternate-owner-image-shadow .github/workflows/docker.yml \
+  $'  build:\n    name: Build (${{ matrix.platform }})' \
+  $'  build:\n    name: Build (${{ matrix.platform }})\n    env:\n      IMAGE_NAME: ghcr.io/another-owner/buzz'
+run_negative_probe "$fixture_base" same-value-image-shadow .github/workflows/docker.yml \
+  $'  merge:\n    name: Merge multi-arch manifest' \
+  $'  merge:\n    name: Merge multi-arch manifest\n    env: { IMAGE_NAME: ghcr.io/zachlendon/buzz }'
 run_negative_probe "$fixture_base" relay-job-upstream-guard .github/workflows/docker.yml \
   $'  build:\n    name: Build (${{ matrix.platform }})' \
   $'  build:\n    name: Build (${{ matrix.platform }})\n    if: github.repository == '\''block/buzz'\'''
@@ -243,5 +277,13 @@ run_negative_probe "$fixture_base" push-gateway-build-guard .github/workflows/do
 run_negative_probe "$fixture_base" push-gateway-merge-guard .github/workflows/docker.yml \
   "    if: github.repository == 'block/buzz' && github.event_name != 'pull_request'" \
   "    if: github.event_name != 'pull_request'"
+run_negative_probe "$fixture_base" quoted-upstream-reference .github/CODEOWNERS \
+  '* @block/buzz-oss-team' '"ghcr.io/block/buzz"'
+run_negative_probe "$fixture_base" parenthesized-upstream-reference .github/CODEOWNERS \
+  '* @block/buzz-oss-team' '(ghcr.io/block/buzz)'
+run_negative_probe "$fixture_base" comma-upstream-reference .github/CODEOWNERS \
+  '* @block/buzz-oss-team' 'ghcr.io/block/buzz,'
+run_negative_probe "$fixture_base" period-upstream-reference .github/CODEOWNERS \
+  '* @block/buzz-oss-team' 'ghcr.io/block/buzz.'
 
 echo "relay image publication contract passed"
