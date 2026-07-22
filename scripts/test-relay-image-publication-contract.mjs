@@ -33,6 +33,13 @@ function mutation(name, relativePath, oldValue, newValue) {
   };
 }
 
+function transformMutation(name, relativePath, transform) {
+  const source = fs.readFileSync(path.join(root, relativePath), "utf8");
+  const transformed = transform(source);
+  assert.notEqual(transformed, source, `mutation must change ${relativePath}`);
+  return { name, overrides: new Map([[relativePath, transformed]]) };
+}
+
 const workflow = ".github/workflows/docker.yml";
 const canonicalWorkflow = fs.readFileSync(path.join(root, workflow), "utf8");
 const workflowEnvStart = canonicalWorkflow.indexOf("\nenv:\n");
@@ -58,6 +65,30 @@ const positiveCases = [
   },
 ];
 const cases = [
+  mutation(
+    "pull-request-target-event",
+    workflow,
+    "  pull_request:\n",
+    "  pull_request_target: {}\n  pull_request:\n",
+  ),
+  mutation(
+    "broadened-tag-trigger",
+    workflow,
+    '    tags: ["relay-v[0-9]*"]',
+    '    tags: ["*"]',
+  ),
+  mutation(
+    "additional-tag-trigger",
+    workflow,
+    '    tags: ["relay-v[0-9]*"]',
+    '    tags: ["relay-v[0-9]*", "v*"]',
+  ),
+  mutation(
+    "fifth-write-all-job",
+    workflow,
+    "  push-gateway-build:\n",
+    "  publish-extra:\n    runs-on: ubuntu-latest\n    permissions: write-all\n    steps: []\n\n  push-gateway-build:\n",
+  ),
   mutation(
     "main-trigger",
     workflow,
@@ -233,6 +264,66 @@ const cases = [
     "      - name: Attest provenance for the merged image\n        continue-on-error: true\n        # Sigstore",
   ),
   mutation(
+    "secondary-metadata-image",
+    workflow,
+    "          images: ${{ env.IMAGE_NAME }}",
+    "          images: |\n            ${{ env.IMAGE_NAME }}\n            ${{ vars.EXTRA_IMAGE }}",
+  ),
+  mutation(
+    "extra-metadata-annotation",
+    workflow,
+    "          images: ${{ env.IMAGE_NAME }}\n          # Tag matrix",
+    "          images: ${{ env.IMAGE_NAME }}\n          annotations: org.opencontainers.image.ref.name=${{ vars.EXTRA_IMAGE }}\n          # Tag matrix",
+  ),
+  mutation(
+    "extra-metadata-label",
+    workflow,
+    "            org.opencontainers.image.licenses=Apache-2.0",
+    "            org.opencontainers.image.licenses=Apache-2.0\n            org.opencontainers.image.ref.name=${{ vars.EXTRA_IMAGE }}",
+  ),
+  mutation(
+    "secondary-build-tags-input",
+    workflow,
+    "          platforms: ${{ matrix.platform }}\n          labels: ${{ steps.meta.outputs.labels }}",
+    "          platforms: ${{ matrix.platform }}\n          tags: ${{ vars.EXTRA_IMAGE }}\n          labels: ${{ steps.meta.outputs.labels }}",
+  ),
+  mutation(
+    "secondary-build-output",
+    workflow,
+    "          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}",
+    "          outputs: |\n            type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}\n            type=image,name=${{ vars.EXTRA_IMAGE }},push=true",
+  ),
+  mutation(
+    "secondary-build-annotation",
+    workflow,
+    "          labels: ${{ steps.meta.outputs.labels }}\n          # Push by digest",
+    "          labels: ${{ steps.meta.outputs.labels }}\n          annotations: org.opencontainers.image.ref.name=${{ vars.EXTRA_IMAGE }}\n          # Push by digest",
+  ),
+  mutation(
+    "literal-upstream-cache-from",
+    workflow,
+    "            type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}",
+    "            type=registry,ref=ghcr.io/block/buzz-buildcache:${{ matrix.arch }}",
+  ),
+  mutation(
+    "literal-upstream-cache-to",
+    workflow,
+    "            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}",
+    "            type=registry,ref=ghcr.io/block/buzz-buildcache:${{ matrix.arch }},mode=max,compression=zstd",
+  ),
+  mutation(
+    "format-built-upstream-cache-to",
+    workflow,
+    "            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}",
+    "            ${{ format('type=registry,ref=ghcr.io/{0}/{1}-buildcache:{2},mode=max,compression=zstd', 'block', 'buzz', matrix.arch) }}",
+  ),
+  mutation(
+    "split-built-upstream-cache-to",
+    workflow,
+    "            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}",
+    '            \'"type=registry,ref=ghcr.io/" + "block/" + "buzz-buildcache:" + matrix.arch\'',
+  ),
+  mutation(
     "format-built-upstream",
     workflow,
     "          images: ${{ env.IMAGE_NAME }}",
@@ -303,6 +394,45 @@ const cases = [
     ".github/CODEOWNERS",
     "* @block/buzz-oss-team",
     "ghcr.io/block/buzz.",
+  ),
+  mutation(
+    "unpinned-docker-action",
+    workflow,
+    "uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10",
+    "uses: actions/checkout@main",
+  ),
+  mutation(
+    "unpinned-ci-activate-hermit",
+    ".github/workflows/ci.yml",
+    "uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616",
+    "uses: cashapp/activate-hermit@v1",
+  ),
+  mutation(
+    "unpinned-ci-paths-filter",
+    ".github/workflows/ci.yml",
+    "uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706",
+    "uses: dorny/paths-filter@v4",
+  ),
+  transformMutation(
+    "ci-contract-before-install",
+    ".github/workflows/ci.yml",
+    (source) => {
+      const contract =
+        "      - name: Relay image publication contract\n        run: pnpm test:relay-image-contract\n";
+      const activation =
+        "      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1\n";
+      return replaceFirst(
+        replaceFirst(source, contract, ""),
+        activation,
+        `${activation}${contract}`,
+      );
+    },
+  ),
+  mutation(
+    "extra-ci-contract-before-install",
+    ".github/workflows/ci.yml",
+    "      - name: Install relay contract dependencies\n",
+    "      - run: pnpm test:relay-image-contract\n      - name: Install relay contract dependencies\n",
   ),
 ];
 
