@@ -4562,10 +4562,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let event = make_event_with_tags(
             "who is here?",
-            vec![
-                vec!["p".into(), b.clone()],
-                vec!["p".into(), a.clone()],
-            ],
+            vec![vec!["p".into(), b.clone()], vec!["p".into(), a.clone()]],
         );
         let batch = FlushBatch {
             channel_id: ch,
@@ -4606,8 +4603,7 @@ mod tests {
     fn test_format_prompt_single_p_no_multi_mention_guidance() {
         let a = "aa".repeat(32);
         let ch = Uuid::new_v4();
-        let event =
-            make_event_with_tags("hello", vec![vec!["p".into(), a.clone()]]);
+        let event = make_event_with_tags("hello", vec![vec!["p".into(), a.clone()]]);
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
