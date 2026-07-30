@@ -2109,6 +2109,32 @@ async fn tokio_main() -> Result<()> {
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
                             let event_id_hex = buzz_event.event.id.to_hex();
+
+                            // Multi-@ stagger: when several agents are p-tagged
+                            // on one event, sleep a deterministic per-rank delay
+                            // before queueing so peers do not all start model
+                            // turns at once (thundering herd on local Ollama).
+                            let multi_p_step = multi_p_stagger_step_ms();
+                            let delay_ms = multi_p_stagger_delay_ms(
+                                &buzz_event.event,
+                                &pubkey_hex,
+                                multi_p_step,
+                            );
+                            if delay_ms > 0 {
+                                if let Some((rank, peer_count)) =
+                                    multi_p_rank_and_count(&buzz_event.event, &pubkey_hex)
+                                {
+                                    tracing::info!(
+                                        rank,
+                                        peer_count,
+                                        delay_ms,
+                                        event_id = %event_id_hex,
+                                        "multi_p_stagger"
+                                    );
+                                }
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
+
                             // Clone for the non-cancelling steer fork, which
                             // needs the event to render the steer body. The
                             // clone is unconditional because we don't know
@@ -2570,6 +2596,69 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
             && t.as_slice().get(1).map(|s| s.as_str()) == Some(agent_pubkey_hex)
     })
+}
+
+/// Default per-rank delay when several agents are multi-@mentioned on one event.
+/// Override with `BUZZ_ACP_MULTI_P_STAGGER_MS` (clamped 0..=10_000).
+const DEFAULT_MULTI_P_STAGGER_MS: u64 = 1500;
+const MAX_MULTI_P_STAGGER_MS: u64 = 10_000;
+
+/// Resolved multi-p stagger step (ms), from env or default, clamped.
+fn multi_p_stagger_step_ms() -> u64 {
+    std::env::var("BUZZ_ACP_MULTI_P_STAGGER_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MULTI_P_STAGGER_MS)
+        .clamp(0, MAX_MULTI_P_STAGGER_MS)
+}
+
+/// Distinct `p`-tag pubkeys on `event`, sorted lexicographically.
+///
+/// Used for multi-mention stagger rank and prompt guidance. Duplicates collapse
+/// to one entry so rank is stable across tag order.
+pub(crate) fn multi_p_sorted_peers(event: &nostr::Event) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut peers = Vec::new();
+    for t in event.tags.iter() {
+        let s = t.as_slice();
+        if s.first().map(|k| k.as_str()) != Some("p") {
+            continue;
+        }
+        if let Some(pk) = s.get(1).map(|v| v.as_str()) {
+            if !pk.is_empty() && seen.insert(pk.to_string()) {
+                peers.push(pk.to_string());
+            }
+        }
+    }
+    peers.sort_unstable();
+    peers
+}
+
+/// Rank of `agent_pubkey_hex` among distinct sorted `p`-tags, and peer count.
+///
+/// Returns `None` if the agent is not among the p-tags. `peer_count` is always
+/// the number of distinct p-tag pubkeys when `Some`.
+pub(crate) fn multi_p_rank_and_count(
+    event: &nostr::Event,
+    agent_pubkey_hex: &str,
+) -> Option<(usize, usize)> {
+    let peers = multi_p_sorted_peers(event);
+    let peer_count = peers.len();
+    let rank = peers.iter().position(|p| p == agent_pubkey_hex)?;
+    Some((rank, peer_count))
+}
+
+/// Deterministic stagger delay so multi-@mentioned agents do not all start
+/// model turns at once.
+///
+/// Returns `0` if the agent is not mentioned or `peer_count < 2`.
+/// Otherwise `rank * step_ms` where rank is the agent's index in the sorted
+/// distinct p-tag pubkey list.
+fn multi_p_stagger_delay_ms(event: &nostr::Event, agent_pubkey_hex: &str, step_ms: u64) -> u64 {
+    match multi_p_rank_and_count(event, agent_pubkey_hex) {
+        Some((rank, peer_count)) if peer_count >= 2 => (rank as u64).saturating_mul(step_ms),
+        _ => 0,
+    }
 }
 
 fn is_ephemeral_kind(kind_u32: u32) -> bool {
@@ -3883,6 +3972,79 @@ mod heartbeat_base_prompt_tests {
         let prompt = "[System: Heartbeat]\nrun feed get";
         let composed = pool::prepend_base_for_legacy(2, Some("you are a helpful agent"), prompt);
         assert_eq!(composed, prompt);
+    }
+}
+
+#[cfg(test)]
+mod multi_p_stagger_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn make_event_with_p_tags(p_hexes: &[&str]) -> nostr::Event {
+        let keys = Keys::generate();
+        let tags: Vec<Tag> = p_hexes
+            .iter()
+            .map(|hex| Tag::parse(["p", hex]).expect("p tag"))
+            .collect();
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "multi-mention")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn single_p_tag_delay_is_zero() {
+        let agent = "aa".repeat(32);
+        let event = make_event_with_p_tags(&[&agent]);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &agent, 1500), 0);
+        assert_eq!(multi_p_rank_and_count(&event, &agent), Some((0, 1)));
+    }
+
+    #[test]
+    fn multi_p_ordered_ranks() {
+        // Lexicographic order: aa… < bb… < cc…
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let c = "cc".repeat(32);
+        // Tag in non-sorted order to prove rank uses sorted peers.
+        let event = make_event_with_p_tags(&[&c, &a, &b]);
+        let step = 1500u64;
+        assert_eq!(multi_p_stagger_delay_ms(&event, &a, step), 0);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &b, step), step);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &c, step), 2 * step);
+        assert_eq!(multi_p_rank_and_count(&event, &a), Some((0, 3)));
+        assert_eq!(multi_p_rank_and_count(&event, &b), Some((1, 3)));
+        assert_eq!(multi_p_rank_and_count(&event, &c), Some((2, 3)));
+    }
+
+    #[test]
+    fn agent_missing_from_p_tags_delay_is_zero() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let missing = "cc".repeat(32);
+        let event = make_event_with_p_tags(&[&a, &b]);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &missing, 1500), 0);
+        assert_eq!(multi_p_rank_and_count(&event, &missing), None);
+    }
+
+    #[test]
+    fn duplicate_p_tags_collapse_for_rank() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let event = make_event_with_p_tags(&[&b, &a, &b, &a]);
+        assert_eq!(multi_p_sorted_peers(&event), vec![a.clone(), b.clone()]);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &a, 1000), 0);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &b, 1000), 1000);
+        assert_eq!(multi_p_rank_and_count(&event, &a), Some((0, 2)));
+        assert_eq!(multi_p_rank_and_count(&event, &b), Some((1, 2)));
+    }
+
+    #[test]
+    fn no_p_tags_delay_is_zero() {
+        let agent = "aa".repeat(32);
+        let event = make_event_with_p_tags(&[]);
+        assert_eq!(multi_p_stagger_delay_ms(&event, &agent, 1500), 0);
+        assert_eq!(multi_p_rank_and_count(&event, &agent), None);
     }
 }
 
