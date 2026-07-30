@@ -1716,6 +1716,7 @@ pub async fn run_prompt_task(
             );
         }
 
+        let agent_pubkey_hex = ctx.agent_keys.public_key().to_hex();
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
@@ -1728,6 +1729,7 @@ pub async fn run_prompt_task(
                 system_prompt: ctx.system_prompt.as_deref(),
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
+                agent_pubkey_hex: Some(agent_pubkey_hex.as_str()),
             },
         )
     } else {

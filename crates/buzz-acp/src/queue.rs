@@ -1372,6 +1372,22 @@ pub struct FormatPromptArgs<'a> {
     /// For legacy agents it rides in the user message on every turn of the
     /// session, alongside `[Base]`/`[System]`/`[Agent Memory — core]`.
     pub agent_canvas: Option<&'a str>,
+    /// This agent's pubkey hex (for multi-@mention rank / prompt guidance).
+    /// When set and the last batch event has ≥2 distinct p-tags including this
+    /// agent, [`format_prompt`] injects a `[MULTI_MENTION …]` framing block.
+    pub agent_pubkey_hex: Option<&'a str>,
+}
+
+/// Multi-@mention prompt guidance injected when ≥2 agents are p-tagged.
+pub(crate) fn multi_mention_guidance_section(peer_count: usize, rank: usize) -> String {
+    format!(
+        "[MULTI_MENTION peers={peer_count} rank={rank}]\n\
+         You were @mentioned together with other agents. Rules:\n\
+         1. Reply ONLY for your own role in one short bounded message (≤8 lines for roll-call; ≤15 for work).\n\
+         2. Do NOT @ every peer. At most ONE peer handoff if you need the next specialist — single target, one task.\n\
+         3. Roll-call / \"who is here\" / roster: one-line: role + ready/busy + one capability. No tools unless asked.\n\
+         4. Never multi-@ social bots (Lobby/Spark/Pixel/OOS) from work."
+    )
 }
 
 /// Format the `[Base]` section for the base prompt.
@@ -1490,6 +1506,19 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // 3. Conversation context (thread or DM).
     if let Some(ctx) = args.conversation_context {
         sections.push(format_conversation_context(ctx, args.profile_lookup));
+    }
+
+    // 3b. Multi-@mention guidance — when the triggering event p-tags ≥2 agents
+    //     including us, inject short bounded-reply rules so multi-wakes do not
+    //     produce thundering-herd multi-@ cascades.
+    if let Some(agent_hex) = args.agent_pubkey_hex {
+        if let Some((rank, peer_count)) =
+            crate::multi_p_rank_and_count(&last_event.event, agent_hex)
+        {
+            if peer_count >= 2 {
+                sections.push(multi_mention_guidance_section(peer_count, rank));
+            }
+        }
     }
 
     // 4. Cancelled + re-prompt framing. When a turn was cancelled to deliver
@@ -4524,6 +4553,87 @@ mod tests {
             !prompt.contains("[Channel Canvas]"),
             "no canvas section expected when agent_canvas is None; got: {prompt}"
         );
+    }
+
+    #[test]
+    fn test_format_prompt_multi_mention_guidance_injected() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let ch = Uuid::new_v4();
+        let event = make_event_with_tags(
+            "who is here?",
+            vec![vec!["p".into(), b.clone()], vec!["p".into(), a.clone()]],
+        );
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        // Agent `b` is rank 1 of 2 (lexicographic: aa < bb).
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                agent_pubkey_hex: Some(&b),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(
+            prompt.contains("[MULTI_MENTION peers=2 rank=1]"),
+            "expected multi-mention header; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Reply ONLY for your own role"),
+            "expected multi-mention rules; got: {prompt}"
+        );
+        let multi_pos = prompt.find("[MULTI_MENTION").expect("multi block");
+        let event_pos = prompt.find("[Buzz event:").expect("event block");
+        assert!(
+            multi_pos < event_pos,
+            "MULTI_MENTION must precede event block"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_single_p_no_multi_mention_guidance() {
+        let a = "aa".repeat(32);
+        let ch = Uuid::new_v4();
+        let event = make_event_with_tags("hello", vec![vec!["p".into(), a.clone()]]);
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                agent_pubkey_hex: Some(&a),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(
+            !prompt.contains("[MULTI_MENTION"),
+            "single p-tag must not inject multi-mention guidance; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_multi_mention_guidance_section_text() {
+        let s = multi_mention_guidance_section(3, 0);
+        assert!(s.starts_with("[MULTI_MENTION peers=3 rank=0]\n"));
+        assert!(s.contains("Do NOT @ every peer"));
+        assert!(s.contains("Never multi-@ social bots"));
     }
 
     #[test]
