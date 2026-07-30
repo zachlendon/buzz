@@ -20,8 +20,8 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    EPHEMERAL_KIND_MAX, EPHEMERAL_KIND_MIN, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_TYPING_INDICATOR,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -1449,13 +1449,10 @@ async fn tokio_main() -> Result<()> {
             vec![SubscriptionRule {
                 name: "mentions".into(),
                 channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_else(|| {
-                    vec![
-                        KIND_STREAM_MESSAGE,
-                        KIND_WORKFLOW_APPROVAL_REQUESTED,
-                        KIND_STREAM_REMINDER,
-                    ]
-                }),
+                kinds: config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(config::default_agent_prompt_kinds),
                 require_mention: !config.no_mention_filter,
                 filter: None,
                 compiled_filter: None,
@@ -1464,10 +1461,15 @@ async fn tokio_main() -> Result<()> {
             }]
         }
         SubscribeMode::All => {
+            // All channels / authors (respond_to), not every Nostr kind. Default
+            // kinds exclude ephemeral typing indicators (kind 20002).
             vec![SubscriptionRule {
                 name: "all".into(),
                 channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_default(),
+                kinds: config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(config::default_agent_prompt_kinds),
                 require_mention: false,
                 filter: None,
                 compiled_filter: None,
@@ -1938,6 +1940,20 @@ async fn tokio_main() -> Result<()> {
                                         );
                                     }
                                 }
+                                continue;
+                            }
+
+                            // Ephemeral kinds (20000–29999) are never durable and must not
+                            // become agent prompts. Typing indicators (20002) always have
+                            // empty content; treating them as messages produces "blank
+                            // message" hallucinations under subscribe=all.
+                            if is_ephemeral_kind(kind_u32) {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    kind = kind_u32,
+                                    typing = kind_u32 == KIND_TYPING_INDICATOR,
+                                    "dropping ephemeral event — not an agent prompt kind"
+                                );
                                 continue;
                             }
 
@@ -2554,6 +2570,10 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
             && t.as_slice().get(1).map(|s| s.as_str()) == Some(agent_pubkey_hex)
     })
+}
+
+fn is_ephemeral_kind(kind_u32: u32) -> bool {
+    (EPHEMERAL_KIND_MIN..=EPHEMERAL_KIND_MAX).contains(&kind_u32)
 }
 
 fn is_owner_control_command(
@@ -3913,6 +3933,23 @@ mod owner_control_command_tests {
             "!rotate",
             &agent
         ));
+    }
+
+    #[test]
+    fn typing_indicator_is_ephemeral_and_not_a_prompt_kind() {
+        assert!(is_ephemeral_kind(KIND_TYPING_INDICATOR));
+        assert!(is_ephemeral_kind(20002));
+        assert!(is_ephemeral_kind(EPHEMERAL_KIND_MIN));
+        assert!(is_ephemeral_kind(EPHEMERAL_KIND_MAX));
+        assert!(!is_ephemeral_kind(KIND_STREAM_MESSAGE));
+        assert!(!is_ephemeral_kind(1));
+        assert!(!is_ephemeral_kind(EPHEMERAL_KIND_MIN - 1));
+        assert!(!is_ephemeral_kind(EPHEMERAL_KIND_MAX + 1));
+
+        let kinds = config::default_agent_prompt_kinds();
+        assert!(kinds.contains(&KIND_STREAM_MESSAGE));
+        assert!(!kinds.contains(&KIND_TYPING_INDICATOR));
+        assert!(!kinds.iter().any(|k| is_ephemeral_kind(*k)));
     }
 
     #[test]

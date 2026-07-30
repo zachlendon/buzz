@@ -1124,14 +1124,28 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
 }
 
 /// Resolve per-channel NIP-01 filters from config + discovered channels.
+
+/// Default kinds that may become agent prompts.
+///
+/// Excludes ephemeral kinds (20000–29999), notably typing indicators
+/// (`KIND_TYPING_INDICATOR` = 20002) which always carry empty content and must
+/// never be forwarded to the model as blank "messages".
+pub fn default_agent_prompt_kinds() -> Vec<u32> {
+    use buzz_core::kind::{
+        KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    };
+    vec![
+        KIND_STREAM_MESSAGE,
+        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_STREAM_REMINDER,
+    ]
+}
+
 pub fn resolve_channel_filters(
     config: &Config,
     discovered_channels: &[Uuid],
     rules: &[SubscriptionRule],
 ) -> HashMap<Uuid, ChannelFilter> {
-    use buzz_core::kind::{
-        KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
-    };
 
     let target_channels: Vec<Uuid> = if let Some(ref overrides) = config.channels_override {
         overrides
@@ -1147,13 +1161,10 @@ pub fn resolve_channel_filters(
 
     match config.subscribe_mode {
         SubscribeMode::Mentions => {
-            let kinds = config.kinds_override.clone().unwrap_or_else(|| {
-                vec![
-                    KIND_STREAM_MESSAGE,
-                    KIND_WORKFLOW_APPROVAL_REQUESTED,
-                    KIND_STREAM_REMINDER,
-                ]
-            });
+            let kinds = config
+                .kinds_override
+                .clone()
+                .unwrap_or_else(default_agent_prompt_kinds);
             let require_mention = !config.no_mention_filter;
             for ch in &target_channels {
                 result.insert(
@@ -1166,11 +1177,20 @@ pub fn resolve_channel_filters(
             }
         }
         SubscribeMode::All => {
+            // "All" means all channels / authors (subject to respond_to), not every
+            // Nostr kind. Default to stream-message kinds so typing indicators
+            // (kind 20002, empty content, ephemeral) never reach the agent.
+            let kinds = Some(
+                config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(default_agent_prompt_kinds),
+            );
             for ch in &target_channels {
                 result.insert(
                     *ch,
                     ChannelFilter {
-                        kinds: config.kinds_override.clone(),
+                        kinds: kinds.clone(),
                         require_mention: false,
                     },
                 );
@@ -1231,9 +1251,6 @@ pub fn resolve_dynamic_channel_filter(
     channel_id: Uuid,
     rules: &[crate::filter::SubscriptionRule],
 ) -> Option<ChannelFilter> {
-    use buzz_core::kind::{
-        KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
-    };
 
     // In Mentions/All mode, if the operator explicitly constrained channels
     // with --channels, only allow dynamic subscription to channels in that
@@ -1252,17 +1269,21 @@ pub fn resolve_dynamic_channel_filter(
 
     match config.subscribe_mode {
         SubscribeMode::Mentions => Some(ChannelFilter {
-            kinds: Some(config.kinds_override.clone().unwrap_or_else(|| {
-                vec![
-                    KIND_STREAM_MESSAGE,
-                    KIND_WORKFLOW_APPROVAL_REQUESTED,
-                    KIND_STREAM_REMINDER,
-                ]
-            })),
+            kinds: Some(
+                config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(default_agent_prompt_kinds),
+            ),
             require_mention: !config.no_mention_filter,
         }),
         SubscribeMode::All => Some(ChannelFilter {
-            kinds: config.kinds_override.clone(),
+            kinds: Some(
+                config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(default_agent_prompt_kinds),
+            ),
             require_mention: false,
         }),
         SubscribeMode::Config => {
@@ -1619,19 +1640,25 @@ mod tests {
     }
 
     #[test]
-    fn test_all_mode_wildcard() {
+    fn test_all_mode_defaults_to_stream_message_kinds() {
         let config = test_config(SubscribeMode::All);
         let channels = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let result = resolve_channel_filters(&config, &channels, &[]);
 
         assert_eq!(result.len(), 3);
+        let expected = default_agent_prompt_kinds();
         for ch in &channels {
             let f = result.get(ch).unwrap();
-            assert!(
-                f.kinds.is_none(),
-                "all mode with no override = wildcard kinds"
+            assert_eq!(
+                f.kinds.as_ref().unwrap(),
+                &expected,
+                "all mode defaults to agent prompt kinds (not typing/ephemeral)"
             );
             assert!(!f.require_mention);
+            assert!(
+                !expected.contains(&20002),
+                "typing indicator kind must not be a default prompt kind"
+            );
         }
     }
 

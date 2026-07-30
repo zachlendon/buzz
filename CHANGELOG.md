@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **buzz-acp:** stop treating typing indicators (kind 20002) and other ephemeral events as agent prompts. `SubscribeMode::All` now defaults to stream-message kinds (all *channels*, not all *event kinds*), and the inbound path hard-drops ephemeral kinds (20000–29999). Fixes blank-message replies when humans type in channels under `subscribe=all`.
+
+
 ## v0.4.22
 
 - Keep avatar preview visible during upload ([#2237](https://github.com/block/buzz/pull/2237)) ([`f609fcee0`](https://github.com/block/buzz/commit/f609fcee02cd3de9cde2aa4f94fc054d1865a58a))
