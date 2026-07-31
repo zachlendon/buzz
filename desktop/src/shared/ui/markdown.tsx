@@ -67,7 +67,7 @@ import {
   type MediaContextMenuPosition,
   useDismissMediaContextMenu,
 } from "./markdown/MediaContextMenu";
-import { isVideoMedia } from "./markdown/mediaEntry";
+import { isInlineableMediaUrl, isVideoMedia } from "./markdown/mediaEntry";
 import {
   clampImageLightboxZoom,
   type ImageGalleryDirection,
@@ -1426,6 +1426,48 @@ function createMarkdownComponents(
       );
     }
 
+    // Bare media autolinks and `[label](media-url)` must play inline via the
+    // authenticated media proxy — never target="_blank" to the OS browser
+    // (pilot `BUZZ_REQUIRE_MEDIA_GET_AUTH` makes raw browser GETs 401).
+    if (href) {
+      const mediaEntry = imetaByUrl?.get(href);
+      if (isInlineableMediaUrl(href, mediaEntry?.m)) {
+        const resolvedSrc = rewriteRelayUrl(href);
+        const isVideo = isVideoMedia(href, mediaEntry?.m);
+        if (isVideo) {
+          return (
+            <span
+              className={cn(
+                mediaInset && "mx-1.5 block max-w-[calc(100%-0.75rem)]",
+              )}
+              data-block-media=""
+            >
+              <MarkdownVideoPlayer
+                key={href}
+                alt={label || undefined}
+                entry={mediaEntry}
+                resolvedSrc={resolvedSrc}
+                src={href}
+              />
+            </span>
+          );
+        }
+        return (
+          <span data-block-media="" className="block min-w-0 max-w-full">
+            <ImageBlock
+              alt={label || undefined}
+              dim={mediaEntry?.dim}
+              resolvedSrc={resolvedSrc}
+              src={href}
+              thumbSrc={
+                mediaEntry?.thumb ? rewriteRelayUrl(mediaEntry.thumb) : undefined
+              }
+            />
+          </span>
+        );
+      }
+    }
+
     // Intercept `buzz://message?channel=…&id=…` links so a click navigates
     // in-app instead of opening the URL in the OS browser. http(s) links
     // continue to use the existing target="_blank" behavior.
@@ -1799,7 +1841,9 @@ function createMarkdownComponents(
  * four instances ever exist. Module-stable maps mean cached markdown element
  * trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "4";
+// v5: markdown `a` renders inlineable media URLs as video/image blocks (not
+// external browser links), so private-pilot media auth works in-channel.
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "5";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };

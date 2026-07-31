@@ -4,6 +4,9 @@
  * questions.
  *
  * `isVideoMedia` decides the render path (video player vs. image block).
+ * `isInlineableMediaUrl` decides whether a markdown *link* (`[…](url)` or a
+ * bare autolink) should render as inline media instead of an external browser
+ * link — required for private-pilot media GET auth (raw browser GETs 401).
  * `isRelayDownloadable` decides download eligibility, which is separate: an
  * off-relay video still renders as a video and can be Copy-Link'd, it just
  * can't be downloaded (the Rust `validate_download_url` SSRF gate accepts only
@@ -15,6 +18,16 @@
 
 /** Legacy video extensions, used only when an imeta MIME type is absent. */
 const VIDEO_EXTENSIONS = ["mp4", "webm", "mov"] as const;
+
+/** Image extensions for bare-link / autolink inline promotion (no imeta MIME). */
+const IMAGE_EXTENSIONS = [
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "avif",
+] as const;
 
 /** The lowercased path extension of a URL, ignoring query strings and hashes. */
 function urlPathExtension(src: string): string | undefined {
@@ -44,6 +57,27 @@ export function isVideoMedia(src: string, imetaMime?: string): boolean {
   const ext = urlPathExtension(src);
   return (
     ext !== undefined && (VIDEO_EXTENSIONS as readonly string[]).includes(ext)
+  );
+}
+
+/**
+ * Whether a markdown link `href` should render as inline image/video instead
+ * of an external OS-browser link.
+ *
+ * MIME wins when present (image/* and video/* only). Without MIME, known
+ * image/video path extensions qualify. Non-media MIMEs (PDF, etc.) stay as
+ * FileCard / external links.
+ */
+export function isInlineableMediaUrl(src: string, imetaMime?: string): boolean {
+  if (imetaMime) {
+    const mime = imetaMime.toLowerCase();
+    return mime.startsWith("image/") || mime.startsWith("video/");
+  }
+  const ext = urlPathExtension(src);
+  if (!ext) return false;
+  return (
+    (IMAGE_EXTENSIONS as readonly string[]).includes(ext) ||
+    (VIDEO_EXTENSIONS as readonly string[]).includes(ext)
   );
 }
 
