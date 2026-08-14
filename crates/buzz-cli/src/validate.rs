@@ -178,6 +178,23 @@ pub fn read_or_stdin(value: &str) -> Result<String, CliError> {
     }
 }
 
+/// Expand single-quoted argv `\n` / `\t` into real newline / tab.
+///
+/// Agents often pass `--content 'first\n\nsecond'`. The shell keeps the two
+/// characters backslash + n, so the channel shows one unreadable line. If
+/// `content` has no real `\n` or `\r` (the stdin / `printf` path already
+/// produced those), replace the two-character sequences `\\n` and `\\t`.
+/// Content that already contains a real newline is returned unchanged.
+pub fn unescape_argv_newlines(content: &str) -> String {
+    if content.contains('\n') || content.contains('\r') {
+        return content.to_string();
+    }
+    if !content.contains("\\n") && !content.contains("\\t") {
+        return content.to_string();
+    }
+    content.replace("\\n", "\n").replace("\\t", "\t")
+}
+
 /// Read content from a file path, or stdin if the value is "-".
 ///
 /// Unlike [`read_or_stdin`], `value` is never treated as literal content —
@@ -474,6 +491,38 @@ mod tests {
     #[test]
     fn read_or_stdin_passthrough_empty_string() {
         assert_eq!(super::read_or_stdin("").unwrap(), "");
+    }
+
+    // --- unescape_argv_newlines ---
+
+    #[test]
+    fn unescape_argv_newlines_expands_literal_backslash_n() {
+        assert_eq!(unescape_argv_newlines("a\\n\\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn unescape_argv_newlines_leaves_real_newlines_untouched() {
+        // stdin / printf already produced real newlines — even if the
+        // payload also contains the two-character sequence \n, do not rewrite.
+        let with_real = "a\n\nb has \\n letters";
+        assert_eq!(unescape_argv_newlines(with_real), with_real);
+    }
+
+    #[test]
+    fn unescape_argv_newlines_leaves_real_cr_untouched() {
+        let with_cr = "a\rb\\n";
+        assert_eq!(unescape_argv_newlines(with_cr), with_cr);
+    }
+
+    #[test]
+    fn unescape_argv_newlines_empty_and_plain_unchanged() {
+        assert_eq!(unescape_argv_newlines(""), "");
+        assert_eq!(unescape_argv_newlines("hello world"), "hello world");
+    }
+
+    #[test]
+    fn unescape_argv_newlines_expands_literal_backslash_t() {
+        assert_eq!(unescape_argv_newlines("hello\\tworld"), "hello\tworld");
     }
 
     // --- read_file_or_stdin ---

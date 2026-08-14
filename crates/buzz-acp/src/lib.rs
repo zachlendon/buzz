@@ -3510,6 +3510,16 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
         assert!(prompt.contains("buzz messages send ... --content -"));
     }
+
+    #[test]
+    fn shared_base_prompt_teaches_no_second_complete_answer() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("Do not publish a second complete answer"));
+        assert!(prompt.contains("unless a human asked you to revise"));
+        assert!(
+            prompt.contains("If your turn produced anything worth knowing, you MUST publish it")
+        );
+    }
 }
 
 fn default_heartbeat_prompt() -> String {
