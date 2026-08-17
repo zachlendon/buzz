@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isRelayDownloadable, isVideoMedia } from "./mediaEntry.ts";
+import {
+  isInlineableMediaUrl,
+  isRelayDownloadable,
+  isVideoMedia,
+} from "./mediaEntry.ts";
 
 const RELAY = "https://relay.example.com";
 const relayUrl = (name) => `${RELAY}/media/${name}`;
@@ -57,6 +61,37 @@ test("isVideoMedia: an extension substring is not enough", () => {
 test("isVideoMedia: malformed / extensionless URL without MIME is not a video", () => {
   assert.equal(isVideoMedia("not a url"), false);
   assert.equal(isVideoMedia(relayUrl("deadbeef")), false);
+});
+
+// ── isInlineableMediaUrl: promote bare links to inline media ──────────────
+
+test("isInlineableMediaUrl: video and image extensions qualify without MIME", () => {
+  assert.equal(isInlineableMediaUrl(relayUrl("abc.mp4")), true);
+  assert.equal(isInlineableMediaUrl(relayUrl("abc.webm")), true);
+  assert.equal(isInlineableMediaUrl(relayUrl("abc.png")), true);
+  assert.equal(isInlineableMediaUrl(relayUrl("abc.jpg")), true);
+});
+
+test("isInlineableMediaUrl: image/* and video/* MIME qualify", () => {
+  assert.equal(isInlineableMediaUrl(relayUrl("deadbeef"), "video/mp4"), true);
+  assert.equal(isInlineableMediaUrl(relayUrl("deadbeef"), "image/png"), true);
+});
+
+test("isInlineableMediaUrl: non-media MIME does not qualify", () => {
+  assert.equal(
+    isInlineableMediaUrl(relayUrl("abc.pdf"), "application/pdf"),
+    false,
+  );
+  assert.equal(
+    isInlineableMediaUrl(relayUrl("abc.mp4"), "application/pdf"),
+    false,
+  );
+});
+
+test("isInlineableMediaUrl: extensionless / non-media without MIME does not qualify", () => {
+  assert.equal(isInlineableMediaUrl(relayUrl("deadbeef")), false);
+  assert.equal(isInlineableMediaUrl(relayUrl("notes.pdf")), false);
+  assert.equal(isInlineableMediaUrl("not a url"), false);
 });
 
 // ── isRelayDownloadable: eligibility, independent of render kind ──────────
